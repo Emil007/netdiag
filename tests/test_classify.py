@@ -431,6 +431,57 @@ def test_both_lose_gateway_not_local_switch():
     states = resolve_satellite_states(cfg, rows, now)
     r = classify_loss(cfg, lost, local_ping=local, sat_states=states, same_segment_down=True)
     assert r and r.kind == "TOTAL_OUTAGE"
+    assert r.confidence == "confirmed"
+
+
+def test_empty_sat_ping_not_total_confirmed():
+    """Online sat with ping:{} must not confirm TOTAL — fall through to PROBE_ISOLATED single_vantage."""
+    cfg = _cfg(satellites=[SatelliteExpect("sat-wired-1", "ethernet", "always", placement="router")])
+    lost = {"192.168.1.1", "192.168.1.2", "192.168.1.12", "192.168.1.10", "1.1.1.1"}
+    local = _ping({h: 100 for h in lost})
+    now = time.time()
+    rows = [
+        {
+            "vantage_id": "sat-wired-1",
+            "link": "ethernet",
+            "availability": "always",
+            "placement": "router",
+            "received_at": _iso(now),
+            "last_event": "sample",
+            "payload": {"ping": {}},
+        }
+    ]
+    states = resolve_satellite_states(cfg, rows, now)
+    r = classify_loss(cfg, lost, local_ping=local, sat_states=states, same_segment_down=True)
+    assert r is not None
+    assert not (r.kind == "TOTAL_OUTAGE" and r.confidence == "confirmed")
+    assert r.kind == "PROBE_ISOLATED"
+    assert r.confidence == "single_vantage"
+
+
+def test_external_only_sat_ping_uplink_not_confirmed():
+    """Sat that only reports external ok must not confirm UPLINK while gateway is unknown."""
+    cfg = _cfg(satellites=[SatelliteExpect("sat-wired-1", "ethernet", "always", placement="router")])
+    lost = {"192.168.1.1", "192.168.1.2", "1.1.1.1"}
+    hosts = ["192.168.1.1", "192.168.1.2", "192.168.1.12", "192.168.1.10", "1.1.1.1"]
+    local = _ping({h: (100 if h in lost else 0) for h in hosts})
+    sat_ping = {"1.1.1.1": {"sent": 3, "recv": 3, "loss": 0}}
+    now = time.time()
+    rows = [
+        {
+            "vantage_id": "sat-wired-1",
+            "link": "ethernet",
+            "availability": "always",
+            "placement": "router",
+            "received_at": _iso(now),
+            "last_event": "sample",
+            "payload": {"ping": sat_ping},
+        }
+    ]
+    states = resolve_satellite_states(cfg, rows, now)
+    r = classify_loss(cfg, lost, local_ping=local, sat_states=states)
+    assert r and r.kind == "UPLINK_DOWN"
+    assert r.confidence == "single_vantage"
 
 
 def test_config_yaml_env_primary(monkeypatch):

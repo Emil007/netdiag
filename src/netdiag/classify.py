@@ -244,12 +244,13 @@ def classify_loss(
         )
 
     router_side = _router_side_vantage(eth_online, cfg)
-    router_side_ok = _vantage_reaches(router_side, cfg, ("gateway", "external"))
+    router_side_ok = _router_side_ok(eth_online, cfg)
     coord_row = next((r for r in matrix if r["vantage_id"] == cfg.vantage.id), None)
 
-    # Both coordinator and router-side lose gateway → router/ISP, not local switch
+    # Both coordinator and router-side lose gateway → router/ISP, not local switch.
+    # Require measured gateway loss on the sat — unknown/empty ping must not confirm TOTAL.
     if gateway and gateway <= lost:
-        if router_side and not router_side_ok:
+        if router_side and _vantage_gateway_status(router_side, cfg) == "loss":
             return ClassResult(
                 "TOTAL_OUTAGE",
                 "Coordinator and a wired vantage nearer the router both lose the gateway. "
@@ -423,10 +424,31 @@ def _wifi_path_candidate(
     return None
 
 
+def _vantage_gateway_status(row: dict[str, Any] | None, cfg: Config) -> str | None:
+    """ok | loss | mixed | unknown | empty for the gateway group, or None if no gateway group."""
+    if not row:
+        return None
+    groups = row.get("groups") or {}
+    for g in cfg.groups:
+        if g.role == "gateway":
+            return groups.get(g.id)
+    return None
+
+
 def _vantage_reaches(row: dict[str, Any] | None, cfg: Config, roles: tuple[str, ...]) -> bool:
+    """True only when the vantage has a real positive measurement for the roles.
+
+    If gateway is among roles, gateway must be explicitly \"ok\" — never confirm via
+    external alone while gateway is unknown/absent.
+    """
     if not row or row.get("state") != "online":
         return False
     groups = row.get("groups") or {}
+    if "gateway" in roles:
+        for g in cfg.groups:
+            if g.role == "gateway":
+                return groups.get(g.id) == "ok"
+        return False
     for g in cfg.groups:
         if g.role in roles:
             st = groups.get(g.id)
@@ -451,6 +473,7 @@ def _router_side_vantage(eth_online: list[dict[str, Any]], cfg: Config) -> dict[
 
 
 def _router_side_ok(eth_online: list[dict[str, Any]], cfg: Config) -> bool:
+    """Router-side sat reached the gateway (explicit ok) — for PROBE/UPLINK confirmation."""
     return _vantage_reaches(_router_side_vantage(eth_online, cfg), cfg, ("gateway", "external"))
 
 
