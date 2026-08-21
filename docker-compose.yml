@@ -1,0 +1,43 @@
+# netdiag coordinator — deploy on one always-on Linux Docker host (NAS / Pi / VM).
+# Requires: network_mode host, NET_RAW + NET_ADMIN, config.yaml filled (see docs/MAPPING.md).
+#
+# Portainer: Stacks → add stack → paste this file (or Git deploy) → set volume path for ./data
+# and mount your edited config.yaml.
+
+services:
+  analyzer:
+    image: ghcr.io/emil007/netdiag:latest
+    build: .
+    container_name: netdiag-analyzer
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      IFACE: ${IFACE:-}
+      NETDIAG_CONFIG: /app/config.yaml
+      NETDIAG_DATA: /data
+    volumes:
+      - ./data:/data
+      - ./config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
+
+  capture:
+    image: ghcr.io/emil007/netdiag:latest
+    build: .
+    container_name: netdiag-capture
+    command: ["capture"]
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      IFACE: ${IFACE:-}
+      NETDIAG_CONFIG: /app/config.yaml
+      NETDIAG_DATA: /data
+    volumes:
+      - ./data:/data
+      - ./config.yaml:/app/config.yaml:ro
+    restart: unless-stopped

@@ -1,0 +1,22 @@
+# netdiag satellite — drop on a second Docker host (wired at router, or Wi-Fi).
+# Same image; no pcap. Pushes samples to the coordinator ingest URL.
+
+services:
+  satellite:
+    image: ghcr.io/emil007/netdiag:latest
+    build: .
+    container_name: netdiag-satellite
+    command: ["satellite"]
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      IFACE: ${IFACE:-}
+      NETDIAG_CONFIG: /app/config.yaml
+      NETDIAG_DATA: /data
+    volumes:
+      - ./data:/data
+      - ./config.satellite.yaml:/app/config.yaml:ro
+    restart: unless-stopped

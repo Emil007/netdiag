@@ -1,0 +1,49 @@
+# Copy to config.satellite.yaml on the satellite host.
+# Lightweight probe — no pcap, no HTML. Pushes samples to the coordinator.
+
+site:
+  name: "Home LAN"
+  timezone: Europe/Berlin
+
+vantage:
+  id: laptop_wifi           # unique; must match coordinator satellites list
+  link: wifi                # ethernet | wifi
+  note: "Docker host on Wi-Fi"
+
+capture:
+  iface: wlan0              # or eth0 on a wired satellite
+
+coordinator:
+  url: "http://192.168.1.10:8787/ingest"
+  token: "change-me"
+
+# Same canaries as the coordinator (or a subset)
+groups:
+  - id: router
+    role: gateway
+    hosts: ["192.168.1.1"]
+
+  - id: mesh_a
+    role: mesh
+    hosts: ["192.168.1.2"]
+
+  - id: mesh_b
+    role: mesh
+    hosts: ["192.168.1.3"]
+
+  - id: mesh_c
+    role: mesh
+    hosts: ["192.168.1.4"]
+
+  - id: internet
+    role: external
+    hosts: ["1.1.1.1", "8.8.8.8"]
+
+dns:
+  resolvers: ["192.168.1.1"]
+  names: ["example.com", "cloudflare.com"]
+
+thresholds:
+  ping_interval_s: 5
+  dns_interval_s: 30
+  dns_timeout_ms: 1500

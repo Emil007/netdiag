@@ -1,0 +1,84 @@
+# Copy to config.yaml and edit. See docs/MAPPING.md
+# This is a canary list (~5–15 IPs), not an inventory of every device.
+
+site:
+  name: "Home LAN"
+  timezone: Europe/Berlin
+
+vantage:
+  id: coordinator
+  link: ethernet          # ethernet | wifi
+  note: "main probe host"
+
+capture:
+  iface: eth0             # host NIC (ip -br link)
+  snaplen: 128
+  rotate_hours: 1
+  keep_hours: 48
+
+ingest:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8787
+  token: "change-me"      # must match satellites
+
+# Expected satellites (optional). Silence is interpreted using link type.
+satellites:
+  - id: pc_router
+    link: ethernet
+  - id: laptop_wifi
+    link: wifi
+
+# Named canary groups — add/remove/rename freely. Keep the list small.
+groups:
+  - id: router
+    role: gateway
+    hosts: ["192.168.1.1"]
+
+  - id: mesh_a
+    role: mesh
+    hosts: ["192.168.1.2"]
+
+  - id: mesh_b
+    role: mesh
+    hosts: ["192.168.1.3"]
+
+  - id: mesh_c
+    role: mesh
+    hosts: ["192.168.1.4"]
+
+  # Always-on boxes behind a dumb switch (not every LAN device)
+  - id: wired_office
+    role: branch
+    hosts: ["192.168.1.10", "192.168.1.11"]
+
+  # CRITICAL if this host sits on a switch: another device on THAT same switch
+  - id: same_switch_as_probe
+    role: same_segment
+    hosts: ["192.168.1.12"]
+
+  - id: wifi_sample
+    role: wifi
+    hosts: ["192.168.1.50"]
+
+  - id: internet
+    role: external
+    hosts: ["1.1.1.1", "8.8.8.8"]
+
+dhcp:
+  # Empty = learn first DHCP server MAC, warn on others
+  expected_server_mac: ""
+
+dns:
+  resolvers: ["192.168.1.1"]
+  names: ["example.com", "cloudflare.com", "google.com"]
+
+thresholds:
+  ping_interval_s: 5
+  incident_clear_s: 60
+  dns_interval_s: 30
+  dns_timeout_ms: 1500
+  path_interval_s: 300
+  bcast_pps_warn: 200
+  satellite_stale_s: 45
+  report_interval_s: 60

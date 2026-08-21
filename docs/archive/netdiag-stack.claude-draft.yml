@@ -1,0 +1,469 @@
+# =============================================================================
+# Netzwerk-Diagnose-Stack für das NAS (192.168.1.222, Interface bond0)
+# Version 2: mit eingebauter Auswertung
+#
+# Zweck: sporadische Disconnects (WLAN + LAN gemischt, mehrmals täglich)
+# einfangen UND automatisch vorklassifizieren.
+#
+# Vorbereitung am NAS:
+#   mkdir -p /mnt/HD/HD_a2/Media/Docker/config/netdiag/{netalertx,logs,captures}
+#
+# Danach in Portainer als Stack deployen. network_mode: host macht die Compose,
+# da ist in Portainer nichts zusätzlich einzustellen.
+#
+# -----------------------------------------------------------------------------
+# WAS DU HINTERHER AM NAS LIEGEN HAST  (in .../netdiag/logs/)
+#
+#   STATUS.txt        <- HIER ZUERST REINSCHAUEN. Wird jede Minute neu
+#                        geschrieben: Lagebild, Vorfälle nach Kategorie,
+#                        Verlustquote je Gerät, Fehlerzähler der Netzwerkkarte.
+#   EVENTS.log        <- Ein Block pro erkanntem Vorfall, bereits klassifiziert
+#                        ("HAUPTSWITCH", "TOTALAUSFALL", "EINZELGERAET", ...)
+#                        inklusive Klartext-Verdacht und passendem pcap-Namen.
+#   ALARM-dhcp.log    <- Wird NUR angelegt, wenn ein fremder DHCP-Server
+#                        antwortet. Existiert diese Datei, hast du die Ursache.
+#   ping-JJJJ-MM-TT.csv  <- Rohdaten, falls du selbst nachrechnen willst.
+#   iface-JJJJ-MM-TT.csv <- Zählerstände der NAS-Netzwerkkarte im Zeitverlauf.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # 1) NetAlertX - Geräteinventar und An-/Abmelde-Historie mit Weboberfläche
+  #    http://192.168.1.222:20211
+  #    Falls der Container mit Schreibfehlern auf /data aussteigt:
+  #    user: "0:0" ergänzen (dein Setup läuft ja durchgehend mit PUID/PGID=0).
+  # ---------------------------------------------------------------------------
+  netalertx:
+    image: ghcr.io/netalertx/netalertx:latest
+    container_name: netdiag-netalertx
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - NET_BIND_SERVICE
+    environment:
+      TZ: Europe/Vienna
+      PORT: 20211
+      APP_CONF_OVERRIDE: '{"GRAPHQL_PORT":"20214"}'
+    volumes:
+      - /mnt/HD/HD_a2/Media/Docker/config/netdiag/netalertx:/data
+      - /etc/localtime:/etc/localtime:ro
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 2) netwatch - Messung UND Auswertung in einem
+  #
+  #    Pingt alle Ziele im 5-Sekunden-Takt, liest parallel die Fehlerzähler der
+  #    NAS-Netzwerkkarte aus, fasst zusammenhängende Störungen zu einem Vorfall
+  #    zusammen und ordnet ihn anhand der Topologie einer Ursache zu.
+  #
+  #    >>> HIER MUSST DU RAN: die Gruppen unten mit deinen echten IPs füllen.
+  #    Die Zuordnung ist das, woraus die Klassifizierung entsteht - je genauer
+  #    die Gruppen stimmen, desto präziser der Verdacht.
+  # ---------------------------------------------------------------------------
+  netwatch:
+    image: python:3.12-alpine
+    container_name: netdiag-netwatch
+    network_mode: host
+    cap_add:
+      - NET_RAW
+    environment:
+      TZ: Europe/Vienna
+      IFACE: bond0
+      INTERVAL: "5"          # Sekunden zwischen zwei Messrunden
+      CLEAR_AFTER: "60"      # so lange muss Ruhe sein, bis ein Vorfall endet
+
+      # --- Topologie: bitte anpassen -----------------------------------------
+      T_GATEWAY: "192.168.1.1"
+      T_MESH: ""                        # IPs der beiden Mesh-Fritzboxen
+      T_SWITCH_MAIN: "192.168.1.222"    # Geräte am Netgear GS116E (NAS, PC, ...)
+      T_SWITCH_DESK: ""                 # Geräte hinter dem TP-Link am Schreibtisch
+      T_WIFI: ""                        # ein paar feste WLAN-Clients (Shield, Handy)
+      T_EXTERNAL: "1.1.1.1"
+      # -----------------------------------------------------------------------
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache fping tzdata >/dev/null 2>&1
+        cat > /netwatch.py <<'PYEOF'
+        import os, re, subprocess, time
+        from datetime import datetime
+        from pathlib import Path
+
+        OUT = Path("/out")
+        CAPS = Path("/captures")
+        OUT.mkdir(parents=True, exist_ok=True)
+
+        IFACE       = os.environ.get("IFACE", "bond0")
+        INTERVAL    = int(os.environ.get("INTERVAL", "5"))
+        CLEAR_AFTER = int(os.environ.get("CLEAR_AFTER", "60"))
+
+        GROUP_DEFS = [
+            ("T_GATEWAY",     "Fritz!Box / Gateway"),
+            ("T_MESH",        "Mesh-Fritzboxen"),
+            ("T_SWITCH_MAIN", "am Netgear GS116E"),
+            ("T_SWITCH_DESK", "hinter dem TP-Link"),
+            ("T_WIFI",        "WLAN-Clients"),
+            ("T_EXTERNAL",    "extern"),
+        ]
+
+        GROUPS = {}
+        for key, label in GROUP_DEFS:
+            hosts = os.environ.get(key, "").replace(",", " ").split()
+            if hosts:
+                GROUPS[key] = {"label": label, "hosts": set(hosts)}
+
+        TARGETS  = [h for g in GROUPS.values() for h in sorted(g["hosts"])]
+        EXTERNAL = set(GROUPS.get("T_EXTERNAL", {}).get("hosts", set()))
+        GATEWAY  = set(GROUPS.get("T_GATEWAY",  {}).get("hosts", set()))
+        INTERNAL = set(TARGETS) - EXTERNAL
+
+        LINE = re.compile(r"^(\S+)\s*:\s*xmt/rcv/%loss = (\d+)/(\d+)/(\d+)%")
+        COUNTERS = ["rx_packets", "tx_packets", "multicast",
+                    "rx_errors", "rx_crc_errors", "rx_dropped"]
+
+        stats = {h: {"rounds": 0, "bad": 0, "lost": 0, "sent": 0} for h in TARGETS}
+        incidents = []
+        started = datetime.now()
+
+        def now():
+            return datetime.now()
+
+        def read_counters():
+            vals = {}
+            for name in COUNTERS:
+                p = Path("/sys/class/net") / IFACE / "statistics" / name
+                try:
+                    vals[name] = int(p.read_text().strip())
+                except Exception:
+                    vals[name] = 0
+            return vals
+
+        def ping_round():
+            res = {}
+            if not TARGETS:
+                return res
+            try:
+                proc = subprocess.run(
+                    ["fping", "-c", "3", "-p", "200", "-t", "800", "-q"] + TARGETS,
+                    capture_output=True, text=True, timeout=60)
+                text = (proc.stderr or "") + (proc.stdout or "")
+            except Exception as exc:
+                print("fping-Fehler:", exc, flush=True)
+                return res
+            for line in text.splitlines():
+                m = LINE.match(line.strip())
+                if m:
+                    res[m.group(1)] = {"sent": int(m.group(2)),
+                                       "recv": int(m.group(3)),
+                                       "loss": int(m.group(4))}
+            return res
+
+        def group_label(host):
+            for g in GROUPS.values():
+                if host in g["hosts"]:
+                    return g["label"]
+            return "unbekannt"
+
+        def classify(lost):
+            lost = set(lost)
+            if not lost:
+                return None
+            if lost <= EXTERNAL:
+                return ("INTERNET",
+                        "Nur das externe Ziel war weg. Das Heimnetz war in Ordnung - "
+                        "das ist die Leitung bzw. A1 und fuer die Disconnect-Suche irrelevant.")
+            inner = lost & INTERNAL
+            if INTERNAL and inner == INTERNAL:
+                return ("TOTALAUSFALL",
+                        "Alles weg, auch das Gateway. Klassisch fuer Broadcast-Sturm/Loop "
+                        "oder einen Neustart der Haupt-Fritz!Box. Jetzt lohnt der pcap-Blick.")
+            if INTERNAL and GATEWAY and not (lost & GATEWAY) and inner == (INTERNAL - GATEWAY):
+                return ("HAUPTSWITCH",
+                        "Alles ausser der Fritz!Box war weg. Verdacht: Netgear GS116E, "
+                        "sein Uplink-Kabel oder sein Netzteil.")
+            for g in GROUPS.values():
+                if inner and inner <= g["hosts"]:
+                    if len(inner) == 1:
+                        h = sorted(inner)[0]
+                        return ("EINZELGERAET",
+                                "Nur %s (%s) war weg. Verdacht: das Geraet selbst, "
+                                "sein Switch-Port oder sein Kabel." % (h, g["label"]))
+                    return ("ZWEIG",
+                            "Nur Geraete der Gruppe '%s' waren weg. Verdacht: dieser Zweig - "
+                            "Switch, Uplink oder Access Point." % g["label"])
+            return ("GEMISCHT",
+                    "Betroffene Geraete verteilen sich ueber mehrere Zweige ohne klares Muster. "
+                    "Verdacht: DHCP-Problem, IP-Konflikt oder kurzer Broadcast-Sturm.")
+
+        def matching_pcap(ts):
+            best = None
+            try:
+                for f in CAPS.iterdir():
+                    m = re.match(r"bcast-(\d{8})-(\d{4})", f.name)
+                    if not m:
+                        continue
+                    t = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M")
+                    if t <= ts and (best is None or t > best[0]):
+                        best = (t, f.name)
+            except Exception:
+                pass
+            return best[1] if best else "(noch keine passende Datei)"
+
+        def log_event(inc):
+            dur = int((inc["end"] - inc["start"]).total_seconds())
+            kind, verdict = inc["class"]
+            hosts = ", ".join("%s [%s, %dx]" % (h, group_label(h), n)
+                              for h, n in sorted(inc["hosts"].items(),
+                                                 key=lambda x: -x[1]))
+            delta = inc["delta"]
+            crc = delta.get("rx_crc_errors", 0) + delta.get("rx_errors", 0)
+            bc = delta.get("multicast", 0)
+            extra = ""
+            if crc > 0:
+                extra += ("\n  ACHTUNG: waehrend des Vorfalls +%d Empfangsfehler auf %s "
+                          "-> Hinweis auf ein physikalisches Problem (Kabel, Port, Duplex)."
+                          % (crc, IFACE))
+            if bc > 5000:
+                extra += ("\n  ACHTUNG: +%d Broadcast/Multicast-Frames waehrend des Vorfalls "
+                          "-> starker Sturm-Verdacht." % bc)
+            block = (
+                "\n=== %s  [%s]  Dauer %ds\n"
+                "  Betroffen: %s\n"
+                "  Verdacht:  %s\n"
+                "  pcap:      %s%s\n"
+            ) % (inc["start"].strftime("%Y-%m-%d %H:%M:%S"), kind, dur,
+                 hosts, verdict, matching_pcap(inc["start"]), extra)
+            with (OUT / "EVENTS.log").open("a") as fh:
+                fh.write(block)
+            print(block, flush=True)
+
+        def write_status(base_counters):
+            lines = []
+            lines.append("NETZWERK-DIAGNOSE - Lagebild")
+            lines.append("erzeugt: %s" % now().strftime("%Y-%m-%d %H:%M:%S"))
+            lines.append("Messung laeuft seit: %s" % started.strftime("%Y-%m-%d %H:%M:%S"))
+            lines.append("")
+            lines.append("--- VORFAELLE (seit Start des Containers) ---")
+            if not incidents:
+                lines.append("  keine. Entweder war wirklich Ruhe, oder die Ziele unten")
+                lines.append("  decken die betroffenen Geraete nicht ab.")
+            else:
+                by_kind = {}
+                for inc in incidents:
+                    by_kind.setdefault(inc["class"][0], []).append(inc)
+                for kind in sorted(by_kind, key=lambda k: -len(by_kind[k])):
+                    lines.append("  %-14s %3d x" % (kind, len(by_kind[kind])))
+                lines.append("")
+                lines.append("  Die haeufigste Kategorie ist deine heisseste Spur.")
+                lines.append("  Details je Vorfall stehen in EVENTS.log.")
+                lines.append("")
+                lines.append("  letzte 5:")
+                for inc in incidents[-5:]:
+                    lines.append("    %s  %-14s  %s" % (
+                        inc["start"].strftime("%d.%m. %H:%M:%S"),
+                        inc["class"][0],
+                        ", ".join(sorted(inc["hosts"]))))
+            lines.append("")
+            lines.append("--- VERLUSTQUOTE JE ZIEL ---")
+            lines.append("  %-16s %-24s %8s %8s" % ("IP", "Gruppe", "Runden", "Verlust"))
+            for h in TARGETS:
+                s = stats[h]
+                pct = (100.0 * s["lost"] / s["sent"]) if s["sent"] else 0.0
+                flag = "  <== auffaellig" if pct >= 1.0 else ""
+                lines.append("  %-16s %-24s %8d %7.2f%%%s" % (
+                    h, group_label(h), s["rounds"], pct, flag))
+            lines.append("")
+            lines.append("--- FEHLERZAEHLER %s (seit Containerstart) ---" % IFACE)
+            cur = read_counters()
+            for name in COUNTERS:
+                d = cur[name] - base_counters.get(name, 0)
+                mark = ""
+                if name in ("rx_errors", "rx_crc_errors", "rx_dropped") and d > 0:
+                    mark = "   <== sollte 0 sein! Physikalisches Problem am NAS-Port."
+                lines.append("  %-16s %12d%s" % (name, d, mark))
+            lines.append("")
+            lines.append("--- NAECHSTER SCHRITT ---")
+            if not incidents:
+                lines.append("  Warten bzw. Zielliste erweitern.")
+            else:
+                top = max({i["class"][0] for i in incidents},
+                          key=lambda k: len([i for i in incidents if i["class"][0] == k]))
+                lines.append("  Haeufigste Kategorie: %s" % top)
+                lines.append("  -> passenden Eintrag in EVENTS.log lesen, dort stehen der")
+                lines.append("     Verdacht und die pcap-Datei mit dem Moment des Ausfalls.")
+            lines.append("")
+            tmp = OUT / "STATUS.txt.tmp"
+            tmp.write_text("\n".join(lines))
+            tmp.replace(OUT / "STATUS.txt")
+
+        base_counters = read_counters()
+        prev_counters = dict(base_counters)
+        current = None
+        last_status = 0
+
+        print("netwatch gestartet. Ziele: %s" % ", ".join(TARGETS), flush=True)
+        if not TARGETS:
+            print("KEINE ZIELE KONFIGURIERT - bitte T_* im Compose fuellen.", flush=True)
+
+        while True:
+            loop_start = time.time()
+            ts = now()
+            res = ping_round()
+            cur_counters = read_counters()
+
+            day = ts.strftime("%Y-%m-%d")
+            with (OUT / ("ping-%s.csv" % day)).open("a") as fh:
+                for h in TARGETS:
+                    r = res.get(h, {"sent": 3, "recv": 0, "loss": 100})
+                    fh.write("%s,%s,%d,%d,%d\n" % (
+                        ts.strftime("%Y-%m-%dT%H:%M:%S"), h,
+                        r["sent"], r["recv"], r["loss"]))
+                    st = stats[h]
+                    st["rounds"] += 1
+                    st["sent"] += r["sent"]
+                    st["lost"] += r["sent"] - r["recv"]
+                    if r["loss"] > 0:
+                        st["bad"] += 1
+
+            with (OUT / ("iface-%s.csv" % day)).open("a") as fh:
+                fh.write("%s,%s\n" % (
+                    ts.strftime("%Y-%m-%dT%H:%M:%S"),
+                    ",".join(str(cur_counters[n] - prev_counters[n]) for n in COUNTERS)))
+            prev_counters = cur_counters
+
+            lost = [h for h in TARGETS if res.get(h, {"loss": 100})["loss"] > 0]
+
+            if lost:
+                if current is None:
+                    current = {"start": ts, "end": ts, "hosts": {},
+                               "lost_union": set(), "c_start": dict(cur_counters)}
+                current["end"] = ts
+                current["lost_union"] |= set(lost)
+                for h in lost:
+                    current["hosts"][h] = current["hosts"].get(h, 0) + 1
+            elif current is not None:
+                if (ts - current["end"]).total_seconds() >= CLEAR_AFTER:
+                    current["class"] = classify(current["lost_union"])
+                    current["delta"] = {n: cur_counters[n] - current["c_start"][n]
+                                        for n in COUNTERS}
+                    incidents.append(current)
+                    log_event(current)
+                    current = None
+
+            if time.time() - last_status >= 60:
+                try:
+                    write_status(base_counters)
+                except Exception as exc:
+                    print("Status-Fehler:", exc, flush=True)
+                last_status = time.time()
+
+            sleep = INTERVAL - (time.time() - loop_start)
+            if sleep > 0:
+                time.sleep(sleep)
+        PYEOF
+        exec python3 -u /netwatch.py
+    volumes:
+      - /mnt/HD/HD_a2/Media/Docker/config/netdiag/logs:/out
+      - /mnt/HD/HD_a2/Media/Docker/config/netdiag/captures:/captures:ro
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 3) dhcpwatch - reagiert präzise auf genau einen Fehler
+  #    Hört auf DHCP-Serververkehr und meldet jede Antwort, die NICHT von der
+  #    Fritz!Box kommt. Existiert die Datei ALARM-dhcp.log, hast du einen
+  #    zweiten DHCP-Server im Netz - und damit sehr wahrscheinlich die Ursache.
+  # ---------------------------------------------------------------------------
+  dhcpwatch:
+    image: alpine:latest
+    container_name: netdiag-dhcpwatch
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      TZ: Europe/Vienna
+      IFACE: bond0
+      DHCP_SERVER_MAC: "3c:37:12:47:ae:7c"   # LAN-MAC deiner Haupt-Fritz!Box
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache tcpdump tzdata >/dev/null 2>&1
+        echo "dhcpwatch laeuft, erlaubte Server-MAC: $$DHCP_SERVER_MAC"
+        tcpdump -l -n -e -i $$IFACE 'udp src port 67' 2>/dev/null | while read -r line; do
+          case "$$line" in
+            "")
+              ;;
+            *"$$DHCP_SERVER_MAC"*)
+              echo "$$(date +%Y-%m-%dT%H:%M:%S) ok  $$line" >> /out/dhcp-verkehr.log ;;
+            *)
+              echo "$$(date +%Y-%m-%dT%H:%M:%S) FREMDER DHCP-SERVER: $$line" \
+                >> /out/ALARM-dhcp.log
+              echo "ALARM: fremder DHCP-Server -> $$line" ;;
+          esac
+        done
+    volumes:
+      - /mnt/HD/HD_a2/Media/Docker/config/netdiag/logs:/out
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 4) bcastcap - Beweismittelsammler für den Moment X
+  #    Broadcast, Multicast, ARP und DHCP, Snaplen 128, stündliche Rotation,
+  #    48 Stunden Vorhaltezeit. netwatch verweist in EVENTS.log direkt auf die
+  #    Datei, die den jeweiligen Vorfall enthält.
+  # ---------------------------------------------------------------------------
+  bcastcap:
+    image: alpine:latest
+    container_name: netdiag-bcastcap
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      TZ: Europe/Vienna
+      IFACE: bond0
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache tcpdump tzdata >/dev/null 2>&1
+        mkdir -p /out
+        exec tcpdump -i $$IFACE -n -s 128 \
+          -G 3600 -W 48 -w /out/bcast-%Y%m%d-%H%M.pcap \
+          'broadcast or multicast or arp or port 67 or port 68'
+    volumes:
+      - /mnt/HD/HD_a2/Media/Docker/config/netdiag/captures:/out
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 5) OPTIONAL: ntopng - Live-Traffic-Analyse, erst zuschalten wenn nötig
+  #    Ohne Mirror-Port am GS116E sieht ntopng nur Broadcast/Multicast plus den
+  #    NAS-Verkehr. UI: http://192.168.1.222:3000
+  # ---------------------------------------------------------------------------
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: netdiag-redis
+  #   network_mode: host
+  #   command: redis-server --port 6379 --bind 127.0.0.1 --save ""
+  #   restart: unless-stopped
+  #
+  # ntopng:
+  #   image: ntop/ntopng:stable
+  #   container_name: netdiag-ntopng
+  #   network_mode: host
+  #   cap_add:
+  #     - NET_ADMIN
+  #     - NET_RAW
+  #   depends_on:
+  #     - redis
+  #   command: >-
+  #     --community --interface=bond0 --redis=127.0.0.1:6379
+  #     --http-port=3000 --local-networks="192.168.1.0/24" --dns-mode=1
+  #   volumes:
+  #     - /mnt/HD/HD_a2/Media/Docker/config/netdiag/ntopng:/var/lib/ntopng
+  #   restart: unless-stopped
