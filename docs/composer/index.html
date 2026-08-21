@@ -10,6 +10,7 @@
   <header class="top">
     <div class="brand">netdiag</div>
     <p class="tagline">Build a ready-to-run <code>docker-compose.yml</code> for your home LAN. Everything stays in your browser — nothing is uploaded.</p>
+    <p class="tagline">After <code>docker compose up -d</code>, open live status at <code>http://&lt;coordinator-LAN-IP&gt;:8787/</code> (same port as satellite ingest; LAN only).</p>
   </header>
 
   <main>
@@ -93,7 +94,7 @@
       <section class="actions">
         <button type="submit" class="primary">Generate docker-compose.yml</button>
         <button type="button" id="copyBtn" class="secondary" disabled>Copy to clipboard</button>
-        <button type="button" id="dlSat" class="secondary" disabled>Download satellite compose</button>
+        <button type="button" id="dlSat" class="secondary" disabled>Download satellite compose(s)</button>
       </section>
     </form>
 

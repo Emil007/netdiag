@@ -74,6 +74,7 @@ class Config:
     ingest_port: int
     ingest_token: str
     allow_insecure_ingest: bool
+    status_ui: bool
     satellites: list[SatelliteExpect]
     coordinator_url: str
     coordinator_token: str
@@ -314,6 +315,7 @@ def load_config(path: str | Path | None = None) -> Config:
         ingest_port=int(ingest.get("port", 8787)),
         ingest_token=token,
         allow_insecure_ingest=_env_bool("NETDIAG_ALLOW_INSECURE_INGEST", False),
+        status_ui=_env_bool("NETDIAG_STATUS_UI", bool((thr.get("status_ui", True)))),
         satellites=sats,
         coordinator_url=str(coord.get("url") or ""),
         coordinator_token=str(coord.get("token") or ""),

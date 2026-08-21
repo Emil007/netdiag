@@ -10,7 +10,11 @@
 #
 # Requires Linux Docker Engine + host networking (not Docker Desktop).
 # Optional: paste into Portainer; some UIs want an absolute path for ./data.
-# Ingest will not start until token ≠ change-me (unless NETDIAG_ALLOW_INSECURE_INGEST=1).
+# Ingest will not start accepting satellites until token ≠ change-me
+# (unless NETDIAG_ALLOW_INSECURE_INGEST=1). Status UI always listens on this port:
+#   http://<coordinator-lan-ip>:8787/
+# Prefer binding NETDIAG_INGEST_HOST to your LAN IP on multi-homed hosts.
+# LAN only — do not expose this port to the internet.
 # =============================================================================
 
 services:
@@ -29,12 +33,14 @@ services:
       IFACE: eth0
 
       # Must match satellites. Replace change-me before real use.
+      # Status UI at http://<this-host-lan-ip>:8787/ works even while token is locked.
       NETDIAG_INGEST_TOKEN: change-me
 
       # Optional: prefer LAN IP instead of 0.0.0.0 on multi-homed hosts
       # NETDIAG_INGEST_HOST: 192.168.1.10
       # NETDIAG_INGEST_PORT: "8787"
       # NETDIAG_ALLOW_INSECURE_INGEST: "1"
+      # NETDIAG_STATUS_UI: "0"   # disable live status page (ingest-only)
 
       NETDIAG_DATA: /data
 
@@ -141,6 +147,7 @@ services:
           report_interval_s: 60
           csv_keep_days: 14              # delete ping-/iface-*.csv older than this
           incident_html_keep_days: 30    # prune old incident HTML not in last 200
+          status_ui: true                # live page on same ingest port (:8787/)
 
     volumes:
       # Reports / logs / captures. Portainer: absolute path often works better.

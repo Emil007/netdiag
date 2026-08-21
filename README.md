@@ -22,13 +22,15 @@ docker compose up -d
 
 Short overlays in the same file: `IFACE`, `TZ`, `NETDIAG_INGEST_TOKEN`. No separate `config.yaml` mount is required.
 
-Reports: `data/reports/report.html`, `data/reports/topology.html`. Also `data/logs/STATUS.txt` and `EVENTS.log`.
+**Live status (same port as ingest):** open `http://<coordinator-lan-ip>:8787/` — open incident, census, satellites; links into report/topology HTML. Satellites still `POST` to `http://<ip>:8787/ingest`. LAN only — do not expose this port to the internet. The status page works even while the token is still `change-me`; ingest stays locked until you set a real token.
+
+Reports on disk: `data/reports/report.html`, `data/reports/topology.html`. Also `data/logs/STATUS.txt` and `EVENTS.log`.
 
 Daily `ping-` / `iface-` CSVs are deleted after `csv_keep_days` (default 14). Old incident HTML is pruned after `incident_html_keep_days` (default 30), keeping the last ~200 report links.
 
 If `docker pull` fails: `docker login ghcr.io`, or set the GHCR package visibility to public.
 
-Ingest will **not** start until the token is something other than `change-me` (unless `NETDIAG_ALLOW_INSECURE_INGEST=1` for a lab).
+Ingest will **not** accept satellites until the token is something other than `change-me` (unless `NETDIAG_ALLOW_INSECURE_INGEST=1` for a lab).
 
 **Portainer (optional):** paste the same `docker-compose.yml` into a stack. Some UIs need an absolute path for `./data`.
 

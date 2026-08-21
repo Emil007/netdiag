@@ -120,3 +120,4 @@ thresholds:
   report_interval_s: 60
   csv_keep_days: 14
   incident_html_keep_days: 30
+  status_ui: true

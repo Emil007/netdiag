@@ -52,6 +52,7 @@ def _cfg(**kwargs) -> Config:
         ingest_port=8787,
         ingest_token="secret",
         allow_insecure_ingest=False,
+        status_ui=True,
         satellites=[],
         coordinator_url="",
         coordinator_token="",
@@ -683,3 +684,100 @@ def test_shared_upstream_hint():
     )
     hint = infer_shared_upstream(cfg, {"192.168.1.10", "192.168.1.20"})
     assert hint and "shared upstream" in hint.lower()
+
+
+def test_status_http_ui_and_ingest_auth(tmp_path: Path):
+    """HTTP starts with placeholder token; UI works; POST /ingest locked; good token works."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    from netdiag.ingest import StatusHub, start_ingest
+    from netdiag.store import Store
+
+    reports = tmp_path / "reports"
+    reports.mkdir(parents=True)
+    (reports / "report.html").write_text("<html>ok</html>", encoding="utf-8")
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    store = Store(logs / "t.db")
+
+    # Locked token — server must still start for UI
+    cfg = _cfg(ingest_token="change-me", ingest_host="127.0.0.1", ingest_port=0, status_ui=True)
+    hub = StatusHub()
+    hub.update({"site": "t", "census_text": "census: 1→1", "satellites": [], "open_incident": None})
+    srv = start_ingest(cfg, store, status_hub=hub, data_root=tmp_path)
+    assert srv is not None
+    port = srv.server_address[1]
+    base = f"http://127.0.0.1:{port}"
+
+    try:
+        with urllib.request.urlopen(base + "/", timeout=2) as r:
+            assert r.status == 200
+            body = r.read().decode()
+            assert "netdiag" in body
+            assert "/api/status.json" in body
+
+        with urllib.request.urlopen(base + "/api/status.json", timeout=2) as r:
+            data = json.loads(r.read().decode())
+            assert data.get("ingest_locked") is True
+
+        with urllib.request.urlopen(base + "/reports/report.html", timeout=2) as r:
+            assert r.status == 200
+            assert b"ok" in r.read()
+
+        # POST locked
+        req = urllib.request.Request(
+            base + "/ingest",
+            data=json.dumps({"vantage_id": "s1", "link": "ethernet"}).encode(),
+            headers={"Content-Type": "application/json", "X-Netdiag-Token": "change-me"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(req, timeout=2)
+            assert False, "expected 503"
+        except urllib.error.HTTPError as e:
+            assert e.code == 503
+
+        srv.shutdown()
+        srv.server_close()
+
+        # Open ingest with real token
+        cfg2 = _cfg(ingest_token="secret-token", ingest_host="127.0.0.1", ingest_port=0)
+        srv2 = start_ingest(cfg2, store, status_hub=StatusHub(), data_root=tmp_path)
+        assert srv2 is not None
+        port2 = srv2.server_address[1]
+        base2 = f"http://127.0.0.1:{port2}"
+
+        bad = urllib.request.Request(
+            base2 + "/ingest",
+            data=json.dumps({"vantage_id": "s1"}).encode(),
+            headers={"Content-Type": "application/json", "X-Netdiag-Token": "wrong"},
+            method="POST",
+        )
+        try:
+            urllib.request.urlopen(bad, timeout=2)
+            assert False, "expected 401"
+        except urllib.error.HTTPError as e:
+            assert e.code == 401
+
+        good = urllib.request.Request(
+            base2 + "/ingest",
+            data=json.dumps({"vantage_id": "s1", "link": "ethernet", "event": "sample"}).encode(),
+            headers={"Content-Type": "application/json", "X-Netdiag-Token": "secret-token"},
+            method="POST",
+        )
+        with urllib.request.urlopen(good, timeout=2) as r:
+            assert r.status == 204
+    finally:
+        try:
+            srv.shutdown()
+            srv.server_close()
+        except Exception:
+            pass
+        try:
+            if "srv2" in locals() and srv2 is not None:
+                srv2.shutdown()
+                srv2.server_close()
+        except Exception:
+            pass

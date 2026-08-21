@@ -14,10 +14,21 @@
   const sameSegWrap = $("#sameSegWrap");
 
   let lastCoord = "";
-  let lastSat = "";
+  let lastSats = []; // [{name, text}, ...]
 
   function escYaml(s) {
     return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  function sanitizeBranchId(raw) {
+    let id = String(raw || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+    if (!id) id = "spur";
+    if (/^[0-9]/.test(id)) id = "g_" + id;
+    return id.slice(0, 48);
   }
 
   function randToken() {
@@ -138,7 +149,8 @@
     });
     branches.forEach((b) => {
       const hosts = splitIps(b.hosts);
-      groups += `\n  - id: ${b.id}\n    role: branch\n    attach: ${b.attach || "gateway"}\n    hosts: ${yamlList(hosts)}\n`;
+      const id = sanitizeBranchId(b.id);
+      groups += `\n  - id: ${id}\n    role: branch\n    attach: ${b.attach || "gateway"}\n    hosts: ${yamlList(hosts)}\n`;
     });
     if (d.behindSwitch && d.sameSegmentIp) {
       groups += `\n  - id: same_switch_as_probe\n    role: same_segment\n    hosts: ${yamlList([d.sameSegmentIp])}\n`;
@@ -390,11 +402,14 @@ ${indentBlock(cfg.trimEnd(), 8)}
     }
     lastCoord = buildCoordinatorCompose(d);
     const sats = readRows(satRows).filter((r) => r.id);
-    lastSat = sats.length ? buildSatelliteCompose(d, sats[0]) : "";
+    lastSats = sats.map((s) => ({
+      name: `docker-compose.satellite-${sanitizeBranchId(s.id)}.yml`,
+      text: buildSatelliteCompose(d, s),
+    }));
     preview.textContent = lastCoord;
     previewWrap.classList.remove("hidden");
     copyBtn.disabled = false;
-    dlSat.disabled = !lastSat;
+    dlSat.disabled = !lastSats.length;
     download("docker-compose.yml", lastCoord);
   });
 
@@ -406,8 +421,9 @@ ${indentBlock(cfg.trimEnd(), 8)}
   });
 
   dlSat.addEventListener("click", () => {
-    if (!lastSat) return;
-    download("docker-compose.satellite.yml", lastSat);
+    lastSats.forEach((s, i) => {
+      setTimeout(() => download(s.name, s.text), i * 200);
+    });
   });
 
   // Defaults

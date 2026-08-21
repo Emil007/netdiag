@@ -21,7 +21,7 @@ from .detectors.iface_counters import EthtoolCrcTracker, delta, read_carrier, re
 from .detectors.l2_bridge import L2BridgeWatch
 from .detectors.path_check import run_path_checks_async
 from .detectors.ping_matrix import ping_round, tcp_probe
-from .ingest import start_ingest
+from .ingest import StatusHub, start_ingest
 from .report import append_event, matching_pcap, rotate_events_log, write_reports, write_status
 from .store import Store
 from .timeutil import display_ts, utcnow, utcnow_iso
@@ -76,6 +76,7 @@ class Analyzer:
         self.link_fault_note: str = ""
         self.ethtool_crc = EthtoolCrcTracker()
         self.census = LanCensus()
+        self.status_hub = StatusHub()
 
         learned = self.store.get_kv("dhcp_expected_mac", cfg.expected_dhcp_mac)
         self.dhcp = DhcpWatch(
@@ -209,7 +210,7 @@ class Analyzer:
         )
         for note in self.health_notes:
             print(note, flush=True)
-        start_ingest(self.cfg, self.store)
+        start_ingest(self.cfg, self.store, status_hub=self.status_hub)
         if self.iface_ok:
             self.dhcp.start()
             self.arp.start()
@@ -869,6 +870,41 @@ class Analyzer:
             lines.append(f"  Where: {self.open_inc.get('where_text')}")
             lines.append(f"  Confidence: {self.open_inc.get('confidence') or 'n/a'}")
         write_status("\n".join(lines) + "\n")
+        self._publish_status(sats, census_snap)
+
+    def _publish_status(self, sats: list[dict[str, Any]], census_snap: dict[str, Any]) -> None:
+        token = (self.cfg.ingest_token or "").strip()
+        locked = (not token or token == "change-me") and not self.cfg.allow_insecure_ingest
+        open_payload = None
+        if self.open_inc:
+            iid = self.open_inc.get("id")
+            href = None
+            inc_dir = self.root / "reports" / "incidents"
+            if iid is not None and inc_dir.is_dir():
+                matches = sorted(inc_dir.glob(f"*-{iid}.html"), reverse=True)
+                if matches:
+                    href = f"/reports/incidents/{matches[0].name}"
+            open_payload = {
+                "id": iid,
+                "kind": self.open_inc.get("kind"),
+                "confidence": self.open_inc.get("confidence") or "single_vantage",
+                "where_text": self.open_inc.get("where_text") or "",
+                "href": href,
+            }
+        self.status_hub.update(
+            {
+                "site": self.cfg.site_name,
+                "generated": display_ts(utcnow_iso(), self.cfg.timezone),
+                "vantage_id": self.cfg.vantage.id,
+                "vantage_link": self.cfg.vantage.link,
+                "open_incident": open_payload,
+                "census_text": census_snap.get("text") or "census: n/a",
+                "census": census_snap,
+                "satellites": sats,
+                "health_notes": list(self.health_notes[-5:]),
+                "ingest_locked": locked,
+            }
+        )
 
     def _gateway_mac(self) -> str:
         """Prefer ARP-learned gateway MAC; fall back to DHCP server MAC."""
