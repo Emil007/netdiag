@@ -17,6 +17,8 @@ Reports appear under `data/reports/report.html`. Also see `data/logs/STATUS.txt`
 
 If `docker pull` fails: `docker login ghcr.io`, or set the GHCR package visibility to public.
 
+Ingest will **not** start until `ingest.token` is set to something other than `change-me` (unless `NETDIAG_ALLOW_INSECURE_INGEST=1` for a lab).
+
 **Portainer (optional):** paste the same `docker-compose.yml` into a stack. Some UIs need an absolute path for `./data`.
 
 ## Satellites (optional)

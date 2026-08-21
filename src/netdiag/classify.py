@@ -69,6 +69,7 @@ def resolve_satellite_states(
         row["vantage_id"] = expect.id
         row["link"] = row.get("link") or expect.link
         row["availability"] = expect.resolved_availability()
+        row["placement"] = expect.placement if expect.placement in ("router", "other") else "other"
         state = _compute_state(cfg, row, now_ts, expect)
         row["state"] = state
         row["expected"] = True
@@ -81,9 +82,10 @@ def resolve_satellite_states(
         link = (r.get("link") or "ethernet").lower()
         avail = r.get("availability") or ("intermittent" if link == "wifi" else "always")
         r["availability"] = avail
+        r["placement"] = "other"
         fake = SatelliteExpect(id=r["vantage_id"], link=link, availability=avail)
         r["state"] = _compute_state(cfg, r, now_ts, fake)
-        r["expected"] = False
+        r["expected"] = False  # store/show only — excluded from classify
         out.append(r)
 
     return out
@@ -151,6 +153,7 @@ def build_vantage_matrix(
                 "link": sat.get("link"),
                 "state": state,
                 "availability": sat.get("availability"),
+                "placement": sat.get("placement") or "other",
                 "groups": groups,
                 "ping": ping if state == "online" else {},
             }
@@ -170,7 +173,9 @@ def classify_loss(
     loss_threshold_pct: int = 50,
 ) -> ClassResult | None:
     local_ping = local_ping or {}
-    sat_states = sat_states or []
+    # Unexpected (unlisted) satellites: STATUS only — never triangulation / WIFI_PATH
+    all_sats = sat_states or []
+    sat_states = [s for s in all_sats if s.get("expected", True)]
     matrix = build_vantage_matrix(cfg, local_ping, sat_states, loss_threshold_pct)
 
     eth_online = [
@@ -178,7 +183,9 @@ def classify_loss(
         for r in matrix
         if r.get("link") == "ethernet" and r.get("state") == "online"
     ]
-    wifi_fault = _wifi_path_candidate(cfg, sat_states, eth_online, warmup)
+    wifi_fault = _wifi_path_candidate(
+        cfg, sat_states, eth_online, warmup, lost=lost, local_ping=local_ping
+    )
 
     if carrier_down:
         return ClassResult(
@@ -290,7 +297,7 @@ def classify_loss(
             continue
         inner = lost & internal
         if inner and inner <= gset:
-            sat_sees_g = _group_status_from_sats(eth_online, g.id)
+            sat_sees_g = _group_status_from_sats(eth_online, g.id, cfg.vantage.id)
             if len(inner) == 1:
                 h = next(iter(inner))
                 where = _where_branch(g.id, sat_sees_g, single=True)
@@ -341,21 +348,20 @@ def _wifi_path_candidate(
     sat_states: list[dict[str, Any]],
     eth_online: list[dict[str, Any]],
     warmup: bool,
+    *,
+    lost: set[str] | None = None,
+    local_ping: dict[str, dict[str, Any]] | None = None,
 ) -> str | None:
     if warmup:
         return None
+    lost = lost or set()
+    local_ping = local_ping or {}
     eth_healthy = False
     for r in eth_online:
         if _vantage_reaches(r, cfg, ("gateway",)):
             eth_healthy = True
             break
-    if not eth_healthy and cfg.vantage.link == "ethernet":
-        # use local matrix row implicitly via eth_online including coordinator
-        pass
-
-    # Coordinator ethernet reaching gateway counts
     if cfg.vantage.link == "ethernet":
-        # eth_online includes coordinator when building matrix
         for r in eth_online:
             if r["vantage_id"] == cfg.vantage.id and _vantage_reaches(r, cfg, ("gateway",)):
                 eth_healthy = True
@@ -363,7 +369,14 @@ def _wifi_path_candidate(
     if not eth_healthy:
         return None
 
+    mesh_wifi_hosts = cfg.hosts_by_role("mesh") | cfg.hosts_by_role("wifi")
+    mesh_wifi_lossy = bool(lost & mesh_wifi_hosts) or any(
+        host_down(local_ping.get(h)) for h in mesh_wifi_hosts
+    )
+
     for sat in sat_states:
+        if not sat.get("expected", True):
+            continue
         if sat.get("link") != "wifi":
             continue
         state = sat.get("state")
@@ -372,9 +385,7 @@ def _wifi_path_candidate(
             continue
         if state == "online":
             ping = (sat.get("payload") or {}).get("ping") or {}
-            # lossy while checking in
             if ping and any(host_down(ping.get(h)) for h in ping):
-                # only if gateway loss from wifi sat
                 gw = cfg.hosts_by_role("gateway")
                 if gw and any(host_down(ping.get(h)) for h in gw):
                     return (
@@ -384,10 +395,12 @@ def _wifi_path_candidate(
             continue
         if state == "stale":
             if avail == "intermittent":
-                # intermittent stale without corroboration is NOT WIFI_PATH
-                # need mesh/wifi canary loss corroboration
+                if mesh_wifi_lossy:
+                    return (
+                        f"Intermittent Wi-Fi satellite '{sat['vantage_id']}' went silent, and "
+                        "mesh/Wi-Fi canaries are also lossy while ethernet still reaches the router."
+                    )
                 continue
-            # always-on wifi sat went stale recently
             return (
                 f"Always-on Wi-Fi satellite '{sat['vantage_id']}' went silent after being online, "
                 "while ethernet vantages still reach the router."
@@ -410,11 +423,16 @@ def _vantage_reaches(row: dict[str, Any] | None, cfg: Config, roles: tuple[str, 
 
 
 def _router_side_vantage(eth_online: list[dict[str, Any]], cfg: Config) -> dict[str, Any] | None:
-    for r in eth_online:
-        if r["vantage_id"] == cfg.vantage.id:
-            continue
-        return r
-    return None
+    others = [r for r in eth_online if r["vantage_id"] != cfg.vantage.id]
+    if not others:
+        return None
+    for r in others:
+        if r.get("placement") == "router":
+            return r
+    for r in others:
+        if _vantage_reaches(r, cfg, ("gateway",)):
+            return r
+    return others[0]
 
 
 def _router_side_ok(eth_online: list[dict[str, Any]], cfg: Config) -> bool:
@@ -429,9 +447,13 @@ def _vantage_isolated(row: dict[str, Any], cfg: Config) -> bool:
     return all(groups.get(gid) == "loss" for gid in gw)
 
 
-def _group_status_from_sats(eth_online: list[dict[str, Any]], group_id: str) -> str | None:
+def _group_status_from_sats(
+    eth_online: list[dict[str, Any]], group_id: str, coord_id: str
+) -> str | None:
+    """Status of group_id from other ethernet vantages only (never the coordinator)."""
     for r in eth_online:
-        # skip will be filtered by caller sometimes
+        if r.get("vantage_id") == coord_id:
+            continue
         st = (r.get("groups") or {}).get(group_id)
         if st in ("ok", "loss"):
             return st

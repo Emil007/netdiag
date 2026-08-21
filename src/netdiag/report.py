@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,6 +107,18 @@ AGG_TEMPLATE = """<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <h2>L2 bridges observed</h2>
+    <p class="meta">Passive STP/LLDP hints on this segment. Many cheap unmanaged switches send nothing — absence does not mean no switch.</p>
+    <ul>
+      {% for b in l2_bridges %}
+      <li><strong>{{ b.kind }}</strong> {{ b.detail }}{% if b.extra %} — {{ b.extra }}{% endif %}</li>
+      {% else %}
+      <li>none</li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <div class="card">
     <h2>Incidents</h2>
     <table>
       <tr><th>When</th><th>Class</th><th>Duration</th><th>Where / detail</th></tr>
@@ -182,25 +195,43 @@ INC_TEMPLATE = """<!DOCTYPE html>
 """
 
 
-def matching_pcap(caps: Path, when: datetime | None = None) -> str:
+def matching_pcap(
+    caps: Path,
+    when: datetime | None = None,
+    timezone_name: str = "UTC",
+) -> str:
     if when is None:
         when = datetime.now(timezone.utc)
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+
+        local_tz = ZoneInfo(timezone_name)
+    except Exception:
+        local_tz = timezone.utc
     best = None
     try:
         for f in caps.iterdir():
             m = re.match(r"bcast-(\d{8})-(\d{4})", f.name)
             if not m:
                 continue
-            # Filenames follow container TZ (same TZ env as capture)
-            t = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M")
-            t = t.replace(tzinfo=when.tzinfo)
-            if t <= when and (best is None or t > best[0]):
-                best = (t, f.name)
+            # Filename is written in container TZ
+            naive = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M")
+            t_local = naive.replace(tzinfo=local_tz)
+            t_utc = t_local.astimezone(timezone.utc)
+            if t_utc <= when.astimezone(timezone.utc) and (best is None or t_utc > best[0]):
+                best = (t_utc, f.name)
     except Exception:
         pass
     return best[1] if best else ""
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def write_incident_html(inc: dict[str, Any], out_dir: Path, cfg: Config) -> str:
@@ -231,7 +262,7 @@ def write_incident_html(inc: dict[str, Any], out_dir: Path, cfg: Config) -> str:
         matrix=matrix,
         group_ids=group_ids,
     )
-    (out_dir / fname).write_text(html, encoding="utf-8")
+    _atomic_write(out_dir / fname, html)
     return fname
 
 
@@ -246,6 +277,7 @@ def write_reports(
     summary_text: str,
     by_kind_weighted: list[tuple[str, float]] | None = None,
     matrix: list[dict[str, Any]] | None = None,
+    l2_bridges: list[dict[str, Any]] | None = None,
 ) -> None:
     root = data_dir()
     reports = root / "reports"
@@ -289,8 +321,9 @@ def write_reports(
         iface_text=iface_text,
         matrix=matrix or [],
         group_ids=group_ids,
+        l2_bridges=l2_bridges or [],
     )
-    (reports / "report.html").write_text(html, encoding="utf-8")
+    _atomic_write(reports / "report.html", html)
     payload = {
         "site": cfg.site_name,
         "generated": generated,
@@ -302,8 +335,9 @@ def write_reports(
         "satellites": satellites,
         "incidents": incidents,
         "matrix": matrix,
+        "l2_bridges": l2_bridges or [],
     }
-    (reports / "report.json").write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    _atomic_write(reports / "report.json", json.dumps(payload, indent=2, default=str))
 
 
 def append_event(text: str) -> None:
@@ -315,8 +349,7 @@ def append_event(text: str) -> None:
 
 def write_status(text: str) -> None:
     path = data_dir() / "logs" / "STATUS.txt"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    _atomic_write(path, text)
 
 
 def rotate_events_log(logs: Path, max_bytes: int = 5_000_000) -> None:

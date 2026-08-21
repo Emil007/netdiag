@@ -29,6 +29,7 @@ class SatelliteExpect:
     link: str
     availability: str = ""  # empty = default from link
     note: str = ""
+    placement: str = "other"  # router | other
 
     def resolved_availability(self) -> str:
         if self.availability in ("always", "intermittent"):
@@ -189,6 +190,7 @@ def load_config(path: str | Path | None = None) -> Config:
                 link=slink if slink in ("ethernet", "wifi") else "ethernet",
                 availability=savail if savail in ("always", "intermittent") else "",
                 note=str(s.get("note") or ""),
+                placement=str(s.get("placement") or "other").lower(),
             )
         )
 

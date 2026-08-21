@@ -40,13 +40,15 @@ ingest:
 # availability defaults: wifi → intermittent, ethernet → always.
 satellites: []
 # satellites:
-#   - id: sat-wired-1          # invented id — must match satellite config vantage.id
+#   - id: sat-wired-1
 #     link: ethernet
-#     availability: always     # plugged into the router / other side of a suspect switch
+#     availability: always
+#     placement: router          # router | other — prefer this for uplink confirmation
 #     note: "optional wired vantage nearer the router"
 #   - id: sat-wifi-1
 #     link: wifi
-#     availability: intermittent   # may sleep; never alone proves WIFI_PATH after hours offline
+#     availability: intermittent
+#     placement: other
 #     note: "optional Wi-Fi vantage"
 
 # Named canary groups — id is the name that appears in "Where" sentences.

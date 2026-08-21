@@ -38,6 +38,11 @@ A **wired satellite on the router** turns those guesses into **confirmed** locat
 | online | Fresh sample |
 | stale | Recently silent — may be a path fault if `always` or corroborated |
 | offline | Graceful goodbye or long silence — parked, not WIFI_PATH |
+| unexpected | Checked in but not listed under `satellites:` — STATUS only, ignored for classify |
+
+## L2 bridges observed
+
+STATUS and `report.html` list passive **STP/LLDP** neighbors seen on the probe segment. Many cheap unmanaged switches send **nothing** — absence does not mean there is no switch. Localization still needs canaries (+ optional wired satellite). If an STP bridge MAC differs from the learned DHCP/router MAC, the report notes an extra L2 bridge on the segment.
 
 ## Roles
 

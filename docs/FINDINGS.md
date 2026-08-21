@@ -15,6 +15,8 @@
 
 Each incident page has a **Where** sentence and a **vantage × group** table. If the confirming satellite is offline/never_seen, confidence is **single vantage**.
 
+**L2 bridges observed** (STATUS / report) is a passive STP/LLDP hint only. Many unmanaged switches are silent.
+
 ## Workflow
 
 1. Open `report.html` — hottest weighted class.
