@@ -10,6 +10,7 @@ from netdiag.capture import reap_old_captures
 from netdiag.classify import classify_loss, resolve_satellite_states
 from netdiag.config import Config, Group, SatelliteExpect, Vantage
 from netdiag.detectors.l2_bridge import parse_l2_line
+from netdiag.detectors.retention import reap_old_csvs, reap_old_incident_html
 
 
 def _cfg(**kwargs) -> Config:
@@ -21,6 +22,8 @@ def _cfg(**kwargs) -> Config:
         snaplen=128,
         rotate_hours=1,
         keep_hours=48,
+        csv_keep_days=14,
+        incident_html_keep_days=30,
         groups=[
             Group("router", "gateway", ["192.168.1.1"]),
             Group("mesh_a", "mesh", ["192.168.1.2"]),
@@ -576,19 +579,70 @@ def test_link_fault_clears_after_quiet(monkeypatch):
     assert a._map_link_fault() is False
 
 
-def test_census_mass_disappear():
+def test_census_one_key_per_arp_host():
     from netdiag.detectors.census import LanCensus
 
-    c = LanCensus(baseline_s=3600, recent_s=120)
+    c = LanCensus()
+    now = time.time()
+    c.observe_host(ip="192.168.1.10", mac="aa:bb:cc:dd:ee:01", now=now)
+    c.observe_host(ip="192.168.1.10", mac="aa:bb:cc:dd:ee:01", now=now)
+    assert len(c.speakers) == 1
+    c.observe_host(ip="192.168.1.11", mac="aa:bb:cc:dd:ee:02", now=now)
+    assert len(c.speakers) == 2
+
+
+def test_census_mass_disappear_sharp_collapse():
+    from netdiag.detectors.census import LanCensus
+
+    c = LanCensus(baseline_s=3600, active_s=900, recent_s=120)
     now = time.time()
     for i in range(20):
-        c.speakers[f"192.168.1.{i}"] = now - 600
-    # only 2 still recent
-    c.speakers["192.168.1.1"] = now
-    c.speakers["192.168.1.2"] = now
+        # Seen within active window (e.g. 5 min ago) then mostly go quiet
+        c.speakers[f"ip:192.168.1.{i}"] = now - 300
+    c.speakers["ip:192.168.1.1"] = now
+    c.speakers["ip:192.168.1.2"] = now
     snap = c.snapshot(now)
     assert snap["mass_disappear"]
+    assert snap["active"] >= 8
     assert "census:" in snap["text"]
+
+
+def test_census_overnight_quiet_not_mass():
+    from netdiag.detectors.census import LanCensus
+
+    c = LanCensus(baseline_s=3600, active_s=900, recent_s=120)
+    now = time.time()
+    # Daytime speakers aged past active window (overnight fade)
+    for i in range(20):
+        c.speakers[f"ip:192.168.1.{i}"] = now - 2000
+    snap = c.snapshot(now)
+    assert snap["active"] == 0
+    assert snap["mass_disappear"] is False
+
+
+def test_reap_old_csvs(tmp_path: Path):
+    old = tmp_path / "ping-2000-01-01.csv"
+    old.write_text("x", encoding="utf-8")
+    os.utime(old, (0, 0))
+    recent = tmp_path / f"ping-{time.strftime('%Y-%m-%d')}.csv"
+    recent.write_text("y", encoding="utf-8")
+    n = reap_old_csvs(tmp_path, keep_days=14)
+    assert n >= 1
+    assert not old.exists()
+    assert recent.exists()
+
+
+def test_reap_old_incident_html(tmp_path: Path):
+    old = tmp_path / "20000101-000000-1.html"
+    old.write_text("<html/>", encoding="utf-8")
+    os.utime(old, (0, 0))
+    keep = tmp_path / "keep-me-99.html"
+    keep.write_text("<html/>", encoding="utf-8")
+    os.utime(keep, (0, 0))
+    n = reap_old_incident_html(tmp_path, keep_days=1, keep_names={"keep-me-99.html"})
+    assert n >= 1
+    assert not old.exists()
+    assert keep.exists()
 
 
 def test_stp_verbose_alpine_line():

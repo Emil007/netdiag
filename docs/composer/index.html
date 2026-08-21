@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>netdiag compose builder</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">netdiag</div>
+    <p class="tagline">Build a ready-to-run <code>docker-compose.yml</code> for your home LAN. Everything stays in your browser — nothing is uploaded.</p>
+  </header>
+
+  <main>
+    <form id="form" autocomplete="off">
+      <section class="panel">
+        <h2>1. Site</h2>
+        <p class="help">A label for reports. Timezone is an IANA name (same as the container <code>TZ</code>).</p>
+        <label>Site name <input name="siteName" value="Home LAN" required /></label>
+        <label>Timezone <input name="timezone" value="Europe/Berlin" required /></label>
+      </section>
+
+      <section class="panel">
+        <h2>2. Coordinator probe</h2>
+        <p class="help">The Linux Docker host that runs the analyzer. Find the LAN NIC with <code>ip -br link</code> (examples: <code>eth0</code>, <code>enp3s0</code>, <code>wlan0</code>). Do <strong>not</strong> list this host’s own IP as a canary.</p>
+        <label>IFACE <input name="iface" value="eth0" required /></label>
+        <label class="check">
+          <input type="checkbox" name="behindSwitch" id="behindSwitch" />
+          This probe sits behind an unmanaged switch
+        </label>
+        <p class="help">If yes, add another always-on device on <em>that same switch</em> (not this host). That enables local-switch vs uplink localization on the map.</p>
+        <label id="sameSegWrap" class="hidden">Same-switch canary IP
+          <input name="sameSegmentIp" placeholder="192.168.1.12" />
+        </label>
+      </section>
+
+      <section class="panel">
+        <h2>3. Canaries</h2>
+        <p class="help">Only always-on devices that answer ping (~5–15 total). Not every phone or laptop.</p>
+        <label>Router / gateway IP <input name="gatewayIp" value="192.168.1.1" required /></label>
+
+        <h3>Mesh / AP management IPs <button type="button" class="linkish" data-add="mesh">+ add</button></h3>
+        <p class="help">Optional. Management IPs must answer ICMP.</p>
+        <div id="meshRows" class="rows"></div>
+
+        <h3>Room / spur groups <button type="button" class="linkish" data-add="branch">+ add</button></h3>
+        <p class="help">Name a spur (e.g. living_room) and 1–2 always-on boxes behind that switch. Attach to <code>gateway</code> unless the spur is on the probe’s own switch.</p>
+        <div id="branchRows" class="rows"></div>
+
+        <h3>Wi‑Fi sample canary (optional)</h3>
+        <label>Wi‑Fi canary IP <input name="wifiIp" placeholder="leave empty if unused" /></label>
+
+        <h3>Internet checks</h3>
+        <label>External IPs <input name="externalIps" value="1.1.1.1, 8.8.8.8" /></label>
+      </section>
+
+      <section class="panel">
+        <h2>4. Ingest token</h2>
+        <p class="help">Satellites must send the same token. Never leave <code>change-me</code> on a real network.</p>
+        <label class="token-row">Token
+          <input name="token" id="token" required />
+          <button type="button" id="genToken">Generate</button>
+        </label>
+      </section>
+
+      <section class="panel">
+        <h2>5. Optional satellites</h2>
+        <p class="help">A second vantage improves “local switch vs uplink vs router.” Wired nearer the router → <code>placement: router</code>. Wi‑Fi laptops should use <code>intermittent</code> so sleep ≠ WIFI_PATH.</p>
+        <div id="satRows" class="rows"></div>
+        <button type="button" class="linkish" data-add="sat">+ satellite</button>
+        <label>Coordinator LAN IP (for satellite URL)
+          <input name="coordIp" placeholder="192.168.1.10" />
+        </label>
+      </section>
+
+      <section class="panel">
+        <details>
+          <summary>6. Advanced thresholds (defaults are fine)</summary>
+          <div class="grid2">
+            <label>ping_interval_s <input name="pingInterval" type="number" value="5" /></label>
+            <label>warmup_s <input name="warmup" type="number" value="150" /></label>
+            <label>loss_threshold_pct <input name="lossPct" type="number" value="50" /></label>
+            <label>confirm_rounds <input name="confirmRounds" type="number" value="2" /></label>
+            <label>csv_keep_days <input name="csvKeep" type="number" value="14" /></label>
+            <label>incident_html_keep_days <input name="incKeep" type="number" value="30" /></label>
+            <label>keep_hours (pcap ring) <input name="keepHours" type="number" value="48" /></label>
+            <label>snaplen <input name="snaplen" type="number" value="256" /></label>
+          </div>
+        </details>
+      </section>
+
+      <section class="actions">
+        <button type="submit" class="primary">Generate docker-compose.yml</button>
+        <button type="button" id="copyBtn" class="secondary" disabled>Copy to clipboard</button>
+        <button type="button" id="dlSat" class="secondary" disabled>Download satellite compose</button>
+      </section>
+    </form>
+
+    <section class="panel preview hidden" id="previewWrap">
+      <h2>Preview</h2>
+      <pre id="preview"></pre>
+    </section>
+  </main>
+
+  <footer>
+    <p>Hand-edit anytime — this builder only generates the same <code>NETDIAG_CONFIG_YAML</code> format as the repo’s compose file. Run on Linux Docker with host networking.</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

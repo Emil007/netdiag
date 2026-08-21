@@ -139,6 +139,8 @@ services:
           satellite_stale_s: 45
           satellite_offline_after_s: 1200
           report_interval_s: 60
+          csv_keep_days: 14              # delete ping-/iface-*.csv older than this
+          incident_html_keep_days: 30    # prune old incident HTML not in last 200
 
     volumes:
       # Reports / logs / captures. Portainer: absolute path often works better.

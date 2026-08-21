@@ -50,6 +50,8 @@ class Config:
     snaplen: int
     rotate_hours: int
     keep_hours: int
+    csv_keep_days: float
+    incident_html_keep_days: float
     groups: list[Group]
     expected_dhcp_mac: str
     dns_resolvers: list[str]
@@ -288,6 +290,8 @@ def load_config(path: str | Path | None = None) -> Config:
         snaplen=int(capture.get("snaplen", 256)),
         rotate_hours=int(capture.get("rotate_hours", 1)),
         keep_hours=int(capture.get("keep_hours", 48)),
+        csv_keep_days=float(thr.get("csv_keep_days", 14)),
+        incident_html_keep_days=float(thr.get("incident_html_keep_days", 30)),
         groups=groups,
         expected_dhcp_mac=str(dhcp.get("expected_server_mac") or "").lower().replace("-", ":"),
         dns_resolvers=[str(x) for x in (dns.get("resolvers") or [])],

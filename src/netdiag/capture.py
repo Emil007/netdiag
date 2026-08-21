@@ -4,29 +4,10 @@ import shutil
 import subprocess
 import threading
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import data_dir, load_config
-
-
-def reap_old_captures(caps: Path, keep_hours: float) -> int:
-    """Delete bcast-*.pcap older than keep_hours. Runs independently of tcpdump."""
-    if keep_hours <= 0:
-        return 0
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=keep_hours)
-    removed = 0
-    if not caps.is_dir():
-        return 0
-    for f in caps.glob("bcast-*.pcap"):
-        try:
-            mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
-            if mtime < cutoff:
-                f.unlink(missing_ok=True)
-                removed += 1
-        except OSError:
-            continue
-    return removed
+from .detectors.retention import reap_old_captures
 
 
 def free_bytes(path: Path) -> int | None:

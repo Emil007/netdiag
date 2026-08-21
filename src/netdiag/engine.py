@@ -124,12 +124,10 @@ class Analyzer:
         self._coalesced_detector("IP_CONFLICT", ip, msg, meta={"ip": ip, "macs": [a, b]})
 
     def _on_arp_speaker(self, ip: str, mac: str) -> None:
-        self.census.observe(ip)
-        if mac:
-            self.census.observe(mac)
+        self.census.observe_host(ip=ip, mac=mac)
 
     def _on_dhcp_client(self, mac: str) -> None:
-        self.census.observe(mac)
+        self.census.observe_host(mac=mac)
 
     def _mark_link_fault(self, note: str) -> None:
         self.link_fault_last_at = time.time()
@@ -393,8 +391,39 @@ class Analyzer:
             if free is not None and free < 500 * 1024 * 1024:
                 self._note(f"WARNING: free space under 500MB ({free} bytes)")
             self._write_outputs(ping, counters, carrier, sat_states, l2tick)
+            self._reap_disk()
             rotate_events_log(self.logs)
             self.last_report = now
+
+    def _reap_disk(self) -> None:
+        from .detectors.retention import reap_old_csvs, reap_old_incident_html
+
+        n = reap_old_csvs(self.logs, self.cfg.csv_keep_days)
+        if n:
+            print(f"reaped {n} old csv log(s)", flush=True)
+        # Keep HTML for incidents still listed in the aggregate report (last 200)
+        keep_names: set[str] = set()
+        reports = self.root / "reports" / "incidents"
+        try:
+            for inc in self.store.list_incidents(200):
+                start = inc.get("start") or ""
+                safe = "".join(c for c in start.replace(":", "").replace("T", "-") if c.isalnum() or c in "-_")
+                keep_names.add(f"{safe}-{inc.get('id')}.html")
+        except Exception:
+            pass
+        if self.open_inc:
+            # open incident page may not be closed yet; keep anything matching id
+            iid = self.open_inc.get("id")
+            if reports.is_dir() and iid is not None:
+                for f in reports.glob(f"*-{iid}.html"):
+                    keep_names.add(f.name)
+        n2 = reap_old_incident_html(
+            reports,
+            keep_days=self.cfg.incident_html_keep_days,
+            keep_names=keep_names,
+        )
+        if n2:
+            print(f"reaped {n2} old incident html", flush=True)
 
     def _eval_dns(self, ping: dict[str, dict[str, Any]]) -> None:
         fails = [r for r in self.last_dns_results if not r.get("ok")]
@@ -768,7 +797,7 @@ class Analyzer:
             f"deltas since start: {dlt}\n"
             f"bcast pps={l2tick.get('pps', 0):.1f} baseline≈{l2tick.get('baseline', 0):.1f}\n"
             f"{census_snap.get('text', 'census: n/a')}"
-            f"{' MASS' if census_snap.get('mass_disappear') else ''}\n"
+            f"{' MASS' if census_snap.get('mass_disappear') and self.open_inc else ''}\n"
             f"canaries={len(self.cfg.hosts())} satellites={len(expected_sats)}\n"
             "Note: DHCP+ARP+merged L2/bcast live sniff; capture service writes the pcap ring.\n"
             "L2 live parse uses tcpdump -v; ring snaplen may still truncate BPDUs — see capture.snaplen.\n"
