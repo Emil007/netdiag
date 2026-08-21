@@ -1,10 +1,9 @@
-# netdiag satellite — drop on a second Docker host (wired at router, or Wi-Fi).
-# Same image; no pcap. Pushes samples to the coordinator ingest URL.
+# netdiag satellite — edit this file, pull image (no local build).
+# Same image as coordinator. Set link to ethernet or wifi.
 
 services:
   satellite:
     image: ghcr.io/emil007/netdiag:latest
-    build: .
     container_name: netdiag-satellite
     command: ["satellite"]
     network_mode: host
@@ -12,11 +11,31 @@ services:
       - NET_RAW
       - NET_ADMIN
     environment:
-      TZ: ${TZ:-Europe/Berlin}
-      IFACE: ${IFACE:-}
-      NETDIAG_CONFIG: /app/config.yaml
+      TZ: Europe/Berlin
+      IFACE: wlan0
+
+      NETDIAG_SITE_NAME: Home LAN
+      NETDIAG_VANTAGE_ID: laptop_wifi
+      NETDIAG_VANTAGE_LINK: wifi
+      NETDIAG_VANTAGE_NOTE: Docker host on Wi-Fi
+
+      # Coordinator LAN IP + matching token
+      NETDIAG_COORDINATOR_URL: http://192.168.1.10:8787/ingest
+      NETDIAG_COORDINATOR_TOKEN: change-me
+
+      NETDIAG_GROUPS: >-
+        [
+          {"id":"router","role":"gateway","hosts":["192.168.1.1"]},
+          {"id":"mesh_a","role":"mesh","hosts":["192.168.1.2"]},
+          {"id":"mesh_b","role":"mesh","hosts":["192.168.1.3"]},
+          {"id":"mesh_c","role":"mesh","hosts":["192.168.1.4"]},
+          {"id":"internet","role":"external","hosts":["1.1.1.1","8.8.8.8"]}
+        ]
+
+      NETDIAG_DNS_RESOLVERS: "192.168.1.1"
+      NETDIAG_DNS_NAMES: "example.com,cloudflare.com"
+      NETDIAG_PING_INTERVAL_S: "5"
       NETDIAG_DATA: /data
     volumes:
       - ./data:/data
-      - ./config.satellite.yaml:/app/config.yaml:ro
     restart: unless-stopped

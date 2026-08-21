@@ -1,31 +1,68 @@
-# netdiag coordinator — deploy on one always-on Linux Docker host (NAS / Pi / VM).
-# Requires: network_mode host, NET_RAW + NET_ADMIN, config.yaml filled (see docs/MAPPING.md).
+# netdiag coordinator — edit this file, pull the image (no local build).
+# Image is built on GitHub Actions: ghcr.io/emil007/netdiag:latest
 #
-# Portainer: Stacks → add stack → paste this file (or Git deploy) → set volume path for ./data
-# and mount your edited config.yaml.
+# Portainer: Stacks → Add stack → paste this YAML → change environment + volume path.
+# Requires Linux Docker host networking (NAS / Pi / Proxmox), not Docker Desktop.
 
 services:
   analyzer:
     image: ghcr.io/emil007/netdiag:latest
-    build: .
     container_name: netdiag-analyzer
     network_mode: host
     cap_add:
       - NET_RAW
       - NET_ADMIN
     environment:
-      TZ: ${TZ:-Europe/Berlin}
-      IFACE: ${IFACE:-}
-      NETDIAG_CONFIG: /app/config.yaml
+      TZ: Europe/Berlin
+      # Host NIC that sees the LAN (ip -br link)
+      IFACE: eth0
+
+      NETDIAG_SITE_NAME: Home LAN
+      NETDIAG_VANTAGE_ID: coordinator
+      NETDIAG_VANTAGE_LINK: ethernet
+      NETDIAG_VANTAGE_NOTE: main probe host
+
+      # Satellite ingest (LAN only). Token must match satellites.
+      NETDIAG_INGEST_ENABLED: "true"
+      NETDIAG_INGEST_HOST: "0.0.0.0"
+      NETDIAG_INGEST_PORT: "8787"
+      NETDIAG_INGEST_TOKEN: change-me
+
+      # Expected satellites (JSON). Silence + link type drives WIFI_PATH etc.
+      NETDIAG_SATELLITES: >-
+        [{"id":"pc_router","link":"ethernet"},{"id":"laptop_wifi","link":"wifi"}]
+
+      # Canary groups (JSON) — few always-on probes, not every device. See docs/MAPPING.md
+      NETDIAG_GROUPS: >-
+        [
+          {"id":"router","role":"gateway","hosts":["192.168.1.1"]},
+          {"id":"mesh_a","role":"mesh","hosts":["192.168.1.2"]},
+          {"id":"mesh_b","role":"mesh","hosts":["192.168.1.3"]},
+          {"id":"mesh_c","role":"mesh","hosts":["192.168.1.4"]},
+          {"id":"wired_office","role":"branch","hosts":["192.168.1.10","192.168.1.11"]},
+          {"id":"same_switch_as_probe","role":"same_segment","hosts":["192.168.1.12"]},
+          {"id":"wifi_sample","role":"wifi","hosts":["192.168.1.50"]},
+          {"id":"internet","role":"external","hosts":["1.1.1.1","8.8.8.8"]}
+        ]
+
+      NETDIAG_DNS_RESOLVERS: "192.168.1.1"
+      NETDIAG_DNS_NAMES: "example.com,cloudflare.com,google.com"
+      # Leave empty to learn first DHCP server MAC
+      NETDIAG_DHCP_MAC: ""
+
+      NETDIAG_PING_INTERVAL_S: "5"
+      NETDIAG_INCIDENT_CLEAR_S: "60"
+      NETDIAG_REPORT_INTERVAL_S: "60"
+      NETDIAG_SATELLITE_STALE_S: "45"
+
       NETDIAG_DATA: /data
     volumes:
+      # Change to an absolute host path in Portainer if relative paths are awkward
       - ./data:/data
-      - ./config.yaml:/app/config.yaml:ro
     restart: unless-stopped
 
   capture:
     image: ghcr.io/emil007/netdiag:latest
-    build: .
     container_name: netdiag-capture
     command: ["capture"]
     network_mode: host
@@ -33,11 +70,12 @@ services:
       - NET_RAW
       - NET_ADMIN
     environment:
-      TZ: ${TZ:-Europe/Berlin}
-      IFACE: ${IFACE:-}
-      NETDIAG_CONFIG: /app/config.yaml
+      TZ: Europe/Berlin
+      IFACE: eth0
+      NETDIAG_SNAPLEN: "128"
+      NETDIAG_ROTATE_HOURS: "1"
+      NETDIAG_KEEP_HOURS: "48"
       NETDIAG_DATA: /data
     volumes:
       - ./data:/data
-      - ./config.yaml:/app/config.yaml:ro
     restart: unless-stopped

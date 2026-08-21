@@ -13,6 +13,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ /app/src/
+COPY config.example.yaml /app/config.yaml
 COPY scripts/entrypoint.sh /entrypoint.sh
 RUN sed -i 's/\r$//' /entrypoint.sh \
     && chmod +x /entrypoint.sh \
