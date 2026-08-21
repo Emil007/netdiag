@@ -1,93 +1,114 @@
-# netdiag — headless Raspberry Pi satellite
+# netdiag — Raspberry Pi satellite (headless)
 
-Bare Pi (empty microSD): flash once with Imager, drop `netdiag.env` + canary
-YAML on the boot partition, boot, then one SSH (or a PowerShell wait script)
-installs Docker and the satellite.
+You can **copy files onto the SD `bootfs` by hand**. `prepare-boot.ps1` is optional
+convenience (UTF-8/LF, generates cloud-init, copies bootstrap). It is **not** required.
 
-## Recommended flow (keeps Imager SSH / Wi‑Fi)
+Flash [Raspberry Pi OS Lite](https://www.raspberrypi.com/software/) first
+(**32-bit** for Pi 2; 64-bit OK on Pi 3+). The FAT volume after Imager is usually **`bootfs`**.
 
-### 1. Flash
+---
 
-[Raspberry Pi Imager](https://www.raspberrypi.com/software/):
+## What each bootfs file does
 
-| Board | OS |
-|-------|-----|
-| **Pi 2 Model B** | Raspberry Pi OS **Lite (32-bit)** |
-| Pi 3 / 4 / 5 / Zero 2 | Lite 64-bit is fine |
+| Bootfs file | Role |
+|-------------|------|
+| `netdiag.env` | Mode, coordinator URL, token, vantage id, iface |
+| `netdiag.groups.yaml` | Canaries (must mirror coordinator `groups:`) |
+| `netdiag-bootstrap.sh` | Installer script (Docker + compose + satellite) |
+| `user-data` + `meta-data` | cloud-init: user/SSH + **runs bootstrap on first boot** |
+| `network-config` | Optional Wi‑Fi (only if you use wifi mode) |
 
-Gear (OS customisation):
+**Important:** `netdiag.env` + `netdiag.groups.yaml` alone are **config only**. They do
+**not** install Docker or start the satellite. Something must still run bootstrap
+(zero-touch `user-data`, or SSH / `-WaitAndBootstrap`).
 
-- Enable **SSH**
-- Username + password
-- Hostname e.g. `netdiag-fritz` / `netdiag-wifi`
-- **Wi‑Fi** only for the wifi satellite  
-  **Pi 2 has no onboard Wi‑Fi** — use a USB dongle and configure Wi‑Fi in Imager
-- Wired sat: Ethernet into the **main router** (Fritzbox), not behind a suspect switch
+| Goal | Files on bootfs |
+|------|-----------------|
+| Config only (finish later over SSH) | `netdiag.env` + `netdiag.groups.yaml` |
+| Ready for SSH bootstrap | above + `netdiag-bootstrap.sh` |
+| **Zero-touch** (no SSH for install) | above + `user-data` + `meta-data` (+ `network-config` if Wi‑Fi) |
 
-### 2. Drop config on `bootfs` (Windows)
+Repo sources (examples): `netdiag.env.example`, `netdiag.groups.yaml.example`,
+`bootstrap.sh`. Personal stacks may use private env files (gitignored).
 
-After write, the FAT volume is usually **bootfs**. From the repo:
+---
+
+## Path A — manual copy
+
+1. Flash Lite. For zero-touch: **skip Imager OS customisation** (you will supply
+   `user-data`). For SSH-later: you may enable SSH/Wi‑Fi in Imager instead.
+2. Copy onto `bootfs` (rename as shown):
+
+| Source in repo | Name on bootfs |
+|----------------|----------------|
+| your env file (e.g. `netdiag.env.example`) | `netdiag.env` |
+| `netdiag.groups.yaml.example` (or your mirror) | `netdiag.groups.yaml` |
+| `bootstrap.sh` | `netdiag-bootstrap.sh` |
+
+3. **Zero-touch:** also add `user-data` + `meta-data` generated for your
+   hostname/user/password (easiest via Path B), or write equivalent cloud-init
+   yourself that runs `/boot/firmware/netdiag-bootstrap.sh` (or `/boot/...`).
+4. Eject, boot. If you skipped `user-data`, SSH in and run:
+   `sudo bash /boot/firmware/netdiag-bootstrap.sh` (or `/boot/netdiag-bootstrap.sh`).
+
+---
+
+## Path B — `prepare-boot.ps1` (optional)
+
+### B1 — Zero-touch (recommended)
+
+Imager = **flash Lite only**, no OS customisation. Then one command writes the
+full set (including generated `user-data` — **requires** `-SshPassword` and/or
+`-SshPubkey`):
 
 ```powershell
-.\scripts\pi-satellite\prepare-boot.ps1 -BootDrive E: -Mode wired `
-  -CoordinatorUrl http://192.168.1.222:8787/ingest -Token 'YOUR_TOKEN' `
-  -GroupsSource '.\personal\pi-satellite\netdiag.groups.yaml'
+.\scripts\pi-satellite\prepare-boot.ps1 -Unattended -BootDrive E: `
+  -Hostname netdiag-wired -SshUser netdiag -SshPassword 'choose-a-real-password' `
+  -EnvSource '.\scripts\pi-satellite\netdiag.env.example' `
+  -GroupsSource '.\scripts\pi-satellite\netdiag.groups.yaml.example'
 ```
 
-Use `-Mode wifi` for the Wi‑Fi Pi. That writes:
+`-BootDrive` is required with `-Unattended`.  
+`-Token` / `-CoordinatorUrl` / `-Mode` only rewrite the env when you **pass those
+params**; otherwise `EnvSource` values are kept.
 
-- `netdiag.env` — mode, coordinator URL, token  
-- `netdiag.groups.yaml` — must mirror coordinator canaries  
+Optional Wi‑Fi: add `-Mode wifi -WifiSsid '…' -WifiPassword '…'` (writes
+`network-config`). Pi 2 needs a USB Wi‑Fi dongle. Prefer editing a dedicated
+env file rather than inventing missing filenames.
 
-Do **not** overwrite Imager’s `user-data` unless you know you need
-`-IncludeCloudInitUserData` (it replaces SSH/Wi‑Fi settings from Imager).
+Power on — first boot installs Docker, pulls `ghcr.io/emil007/netdiag:latest`
+(**linux/arm/v7** on Pi 2), starts the satellite. Needs network to GHCR (package
+public or `docker login`).
 
-### 3. Boot, then install
+### B2 — Config + bootstrap on card, install over SSH later
 
-Eject, power on, wait until the Pi is on the LAN, then either:
+Imager may enable SSH. This does **not** finish setup by itself:
+
+```powershell
+.\scripts\pi-satellite\prepare-boot.ps1 -BootDrive E: `
+  -EnvSource '.\scripts\pi-satellite\netdiag.env.example' `
+  -GroupsSource '.\scripts\pi-satellite\netdiag.groups.yaml.example'
+```
+
+Writes `netdiag.env`, `netdiag.groups.yaml`, `netdiag-bootstrap.sh` — **no**
+`user-data`, so **Docker is not installed until** you run bootstrap:
 
 ```powershell
 .\scripts\pi-satellite\prepare-boot.ps1 -WaitAndBootstrap `
-  -SshHost netdiag-fritz.local -SshUser YOUR_USER
+  -SshHost netdiag-wired.local -SshUser YOUR_USER
 ```
 
-or SSH yourself:
+Or SSH: `sudo bash /boot/firmware/netdiag-bootstrap.sh`
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Emil007/netdiag/main/scripts/pi-satellite/bootstrap.sh | sudo bash
-```
+Do **not** mix Imager OS customisation with `-Unattended`.
 
-(`netdiag.env` on the boot partition supplies MODE / URL / TOKEN.)
+---
 
-Bootstrap installs Docker, pulls `ghcr.io/emil007/netdiag:latest` (**arm/v7**
-on Pi 2), writes `/opt/netdiag/docker-compose.yml`, and enables a systemd unit.
-First image pull on Pi 2 can take several minutes.
+## After install
 
-### 4. Verify
+Coordinator status: `http://<coordinator>:8787/` — vantage leaves `never_seen`.  
+List matching ids under coordinator `satellites:` (defaults if unset in env:
+wired → `sat-fritz-wired`, wifi → `sat-wifi`; override with `NETDIAG_VANTAGE_ID`).
 
-Coordinator status UI: `http://<coordinator>:8787/` — vantage should leave
-`never_seen`. On the Pi: `sudo docker ps`.
-
-## Coordinator `satellites:` ids
-
-Defaults from `NETDIAG_MODE`:
-
-| Mode | vantage id | placement (on coordinator) |
-|------|------------|------------------------------|
-| wired | `sat-fritz-wired` | `router` |
-| wifi | `sat-wifi` | `other` (intermittent) |
-
-## Optional fully unattended cloud-init
-
-Only if you did **not** use Imager OS customisation: copy
-`cloud-init.user-data` → bootfs `user-data` (edit SSH password in that file
-first), plus `netdiag.env` / groups. See comments in `cloud-init.user-data`.
-
-## Re-run
-
-```bash
-sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/Emil007/netdiag/main/scripts/pi-satellite/bootstrap.sh | bash'
-```
-
-Update `/boot/firmware/netdiag.env` or `netdiag.groups.yaml` (Bookworm) or
-`/boot/...` on older images, then re-run.
+Re-run: `sudo bash /boot/firmware/netdiag-bootstrap.sh` (update env/groups on
+boot partition first if needed).

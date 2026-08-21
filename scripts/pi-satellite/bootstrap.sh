@@ -64,8 +64,9 @@ Usage: bootstrap.sh [--mode wired|wifi] [--coordinator URL] [--token TOKEN] ...
   --env-file      path to netdiag.env
   --groups-file   YAML list under groups: (mirror coordinator)
 
-Prefer dropping netdiag.env (+ optional netdiag.groups.yaml) on the boot
-partition before first power-on; cloud-init runs this script automatically.
+Prefer dropping netdiag.env (+ optional netdiag.groups.yaml) and
+netdiag-bootstrap.sh on the boot partition; cloud-init (-Unattended) runs
+this script on first boot. Curl from GitHub is only a fallback.
 EOF
 }
 

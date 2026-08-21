@@ -46,7 +46,11 @@ List the satellite under `satellites:` in the coordinator compose `NETDIAG_CONFI
 
 ### Bare Raspberry Pi (headless)
 
-Flash **Raspberry Pi OS Lite (32-bit)** for Pi 2, or 64-bit for Pi 3+, then use the boot-partition + first-boot flow in [`scripts/pi-satellite/README.md`](scripts/pi-satellite/README.md). Pi 2 has no onboard Wi‑Fi — a USB adapter is required for a Wi‑Fi satellite.
+Flash Raspberry Pi OS Lite (32-bit for Pi 2). You can **copy bootfs files by
+hand** or use `prepare-boot.ps1` — see
+[`scripts/pi-satellite/README.md`](scripts/pi-satellite/README.md).
+**Env + groups alone do not install Docker**; zero-touch needs `user-data` (or
+SSH bootstrap). Image includes **linux/arm/v7** for Pi 2.
 
 ## Docs
 
