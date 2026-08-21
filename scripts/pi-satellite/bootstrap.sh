@@ -171,7 +171,12 @@ GROUPS_INDENTED="$(printf '%s\n' "$GROUPS_YAML" | sed 's/^/          /')"
 export DEBIAN_FRONTEND=noninteractive
 if ! command -v docker >/dev/null 2>&1; then
   log "installing Docker"
-  apt-get update -y
+  apt-get update -y || {
+    log "apt update failed — clearing package lists and retrying"
+    rm -rf /var/lib/apt/lists/*
+    apt-get clean
+    apt-get update -y
+  }
   apt-get install -y ca-certificates curl
   curl -fsSL https://get.docker.com | sh
   systemctl enable --now docker
