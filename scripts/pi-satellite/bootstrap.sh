@@ -89,7 +89,11 @@ if env_path="$(find_env_file)"; then
   log "loading $env_path"
   ENV_LOADED="$env_path"
   tmp_env="$(mktemp)"
-  sed 's/\r$//' "$env_path" >"$tmp_env"
+  # Strip CRLF; quote unquoted values that contain spaces so `source` is safe
+  # (e.g. SITE_NAME=Home LAN → SITE_NAME="Home LAN")
+  sed 's/\r$//' "$env_path" \
+    | sed -E 's/^([A-Za-z_][A-Za-z0-9_]*)=([^"'\''].*[[:space:]].*)$/\1="\2"/' \
+    >"$tmp_env"
   set -a
   # shellcheck disable=SC1090
   source "$tmp_env"
