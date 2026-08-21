@@ -13,9 +13,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ /app/src/
-COPY templates/ /app/templates/
 COPY scripts/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh \
+RUN sed -i 's/\r$//' /entrypoint.sh \
+    && chmod +x /entrypoint.sh \
     && mkdir -p /data/reports/incidents /data/logs /data/captures
 
 ENV PYTHONPATH=/app/src \
