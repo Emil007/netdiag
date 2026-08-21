@@ -123,11 +123,11 @@ write_files:
       set -euo pipefail
       FLAG=/var/lib/netdiag-firstboot.done
       LOG=/var/log/netdiag-firstboot.log
-      exec >>"\$LOG" 2>&1
-      [[ -f "\$FLAG" ]] && exit 0
+      exec >>"`$LOG" 2>&1
+      [[ -f "`$FLAG" ]] && exit 0
       mkdir -p /var/lib
       echo "netdiag-firstboot: waiting for network..."
-      for i in \$(seq 1 60); do
+      for i in {1..60}; do
         if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W2 8.8.8.8 >/dev/null 2>&1; then
           break
         fi
@@ -135,27 +135,27 @@ write_files:
       done
       SCRIPT=""
       for p in /boot/firmware/netdiag-bootstrap.sh /boot/netdiag-bootstrap.sh; do
-        if [[ -f "\$p" ]]; then SCRIPT="\$p"; break; fi
+        if [[ -f "`$p" ]]; then SCRIPT="`$p"; break; fi
       done
       mkdir -p /tmp
-      if [[ -n "\$SCRIPT" ]]; then
-        echo "netdiag-firstboot: using \$SCRIPT"
-        sed 's/\r\$//' "\$SCRIPT" > /tmp/netdiag-bootstrap.sh
+      if [[ -n "`$SCRIPT" ]]; then
+        echo "netdiag-firstboot: using `$SCRIPT"
+        sed 's/\r`$//' "`$SCRIPT" > /tmp/netdiag-bootstrap.sh
       else
         echo "netdiag-firstboot: bootfs bootstrap missing - curl fallback"
         ok=0
-        for i in \$(seq 1 20); do
+        for i in {1..20}; do
           if curl -fsSL --connect-timeout 10 https://raw.githubusercontent.com/Emil007/netdiag/main/scripts/pi-satellite/bootstrap.sh -o /tmp/netdiag-bootstrap.sh; then
             ok=1
             break
           fi
           sleep 15
         done
-        [[ "\$ok" -eq 1 ]] || { echo "netdiag-firstboot: failed to fetch bootstrap"; exit 1; }
+        [[ "`$ok" -eq 1 ]] || { echo "netdiag-firstboot: failed to fetch bootstrap"; exit 1; }
       fi
       chmod +x /tmp/netdiag-bootstrap.sh
       bash /tmp/netdiag-bootstrap.sh
-      touch "\$FLAG"
+      touch "`$FLAG"
       echo "netdiag-firstboot: done"
 
 runcmd:
