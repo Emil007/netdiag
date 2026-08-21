@@ -8,7 +8,17 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 
+# Server replies: BOOTP/DHCP from udp/67 toward client
+_SERVERISH = re.compile(
+    r"(?:\.\d+\.67\s*>|Offer|ACK|ack|Boot Reply|boot reply)",
+    re.I,
+)
+_CLIENTISH = re.compile(
+    r"(?:Discover|Request|Inform|\.68\s*>)",
+    re.I,
+)
 _MAC = re.compile(r"((?:[0-9a-f]{2}:){5}[0-9a-f]{2})", re.I)
+_SIP = re.compile(r"(\d+\.\d+\.\d+\.\d+)\.67\s*>")
 
 
 @dataclass
@@ -16,8 +26,10 @@ class DhcpWatch:
     iface: str
     expected_mac: str = ""
     on_alarm: Callable[[str, str], None] | None = None
+    on_learned: Callable[[str], None] | None = None
     learned_mac: str = ""
     alarms: list[str] = field(default_factory=list)
+    _seen_bad: set[str] = field(default_factory=set)
     _stop: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
 
@@ -32,7 +44,6 @@ class DhcpWatch:
             self._thread.join(timeout=2)
 
     def _run(self) -> None:
-        # tcpdump DHCP replies (boot reply / offer/ack roughly via udp 67/68)
         cmd = [
             "tcpdump",
             "-i",
@@ -40,12 +51,9 @@ class DhcpWatch:
             "-nnel",
             "-l",
             "udp",
+            "src",
             "port",
             "67",
-            "or",
-            "udp",
-            "port",
-            "68",
         ]
         while not self._stop.is_set():
             try:
@@ -60,7 +68,6 @@ class DhcpWatch:
                 self.alarms.append(f"dhcpwatch start failed: {exc}")
                 time.sleep(5)
                 continue
-
             assert proc.stdout is not None
             try:
                 for line in proc.stdout:
@@ -76,21 +83,29 @@ class DhcpWatch:
             time.sleep(1)
 
     def _handle_line(self, line: str) -> None:
-        # Prefer source MAC of frames that look like server replies toward clients
-        if "67 >" not in line and "bootps" not in line.lower() and ".67:" not in line:
-            # still inspect offers
+        if _CLIENTISH.search(line) and not _SERVERISH.search(line):
+            return
+        if not _SERVERISH.search(line) and ".67 >" not in line and "67 >" not in line:
+            # src port 67 filter should already limit; still require reply-ish
             if "Offer" not in line and "ACK" not in line and "ack" not in line:
                 return
         macs = _MAC.findall(line.lower())
         if not macs:
             return
-        # First MAC in -e output is typically source
+        # With -e, first MAC is typically source (server on replies from port 67)
         src = macs[0]
+        if src == "ff:ff:ff:ff:ff:ff":
+            return
         expected = (self.expected_mac or self.learned_mac).lower()
         if not expected:
             self.learned_mac = src
+            if self.on_learned:
+                self.on_learned(src)
             return
-        if src != expected and src not in ("ff:ff:ff:ff:ff:ff",):
+        if src != expected:
+            if src in self._seen_bad:
+                return
+            self._seen_bad.add(src)
             msg = f"Unexpected DHCP server MAC {src} (expected {expected})"
             self.alarms.append(msg)
             if self.on_alarm:

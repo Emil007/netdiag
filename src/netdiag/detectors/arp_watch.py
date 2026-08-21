@@ -4,6 +4,7 @@ import re
 import subprocess
 import threading
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -19,7 +20,9 @@ _IS_AT = re.compile(
 class ArpWatch:
     iface: str
     on_conflict: Callable[[str, str, str], None] | None = None
+    window_s: float = 30.0
     ip_to_mac: dict[str, str] = field(default_factory=dict)
+    recent: dict[str, deque] = field(default_factory=lambda: defaultdict(deque))
     conflicts: list[str] = field(default_factory=list)
     packets: int = 0
     window_start: float = field(default_factory=time.time)
@@ -81,12 +84,21 @@ class ArpWatch:
                 mac, ip = m.group(1).lower(), m.group(2)
             elif m.group(3) and m.group(4):
                 ip, mac = m.group(3), m.group(4).lower()
-        if not ip or not mac:
+        if not ip or not mac or ip == "0.0.0.0":
             return
-        prev = self.ip_to_mac.get(ip)
-        if prev and prev != mac:
-            msg = f"IP conflict / ARP flip: {ip} was {prev}, now {mac}"
-            self.conflicts.append(msg)
-            if self.on_conflict:
-                self.on_conflict(ip, prev, mac)
+        now = time.time()
+        q = self.recent[ip]
+        q.append((now, mac))
+        while q and now - q[0][0] > self.window_s:
+            q.popleft()
+        macs = {m for _, m in q}
+        if len(macs) >= 2:
+            ordered = list(macs)
+            msg = f"IP conflict: {ip} claimed by {ordered[0]} and {ordered[1]} within {self.window_s:.0f}s"
+            # only fire once per window set
+            key = f"{ip}:{','.join(sorted(macs))}"
+            if key not in self.conflicts[-5:]:
+                self.conflicts.append(key)
+                if self.on_conflict:
+                    self.on_conflict(ip, ordered[0], ordered[1])
         self.ip_to_mac[ip] = mac

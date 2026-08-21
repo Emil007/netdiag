@@ -1,47 +1,44 @@
-# Mapping your network into netdiag
+# Mapping your home LAN into netdiag
 
-netdiag is **not** an inventory. With ~100 devices you still only configure **~5–15 always-on canaries**.
+You do **not** list every device. Pick **~5–15 always-on canaries**. Classification answers: which canaries went dark together?
+
+Phones and sleep-prone laptops are bad **canaries**. A laptop may run an intermittent **satellite**; that is different.
+
+Mesh/AP **management IPs must answer ping**.
 
 ## Checklist
 
-1. `capture.iface` — NIC on the Docker host (`ip -br link`)
-2. One `gateway` canary — usually `192.168.1.1` / `192.168.0.1`
-3. One canary per mesh/AP node you care about (`role: mesh`)
-4. If the coordinator sits behind a dumb switch: **another always-on device on that same switch** (`role: same_segment`) — not the probe host itself
-5. Optional branch / Wi‑Fi canaries
-6. `external` canaries (`1.1.1.1`, `8.8.8.8`)
-7. Optional satellites with `vantage.link: ethernet` or `wifi`
+1. `IFACE` on the Docker host (`ip -br link`)
+2. Router canary (`role: gateway`)
+3. Optional mesh/AP canaries
+4. If the probe sits behind an unmanaged switch: **same_segment** = another always-on box on that same switch (not the probe host)
+5. Optional named room/spur groups (`role: branch`) — the group `id` appears in “Where”
+6. External canaries (`1.1.1.1` / `8.8.8.8`); ICMP may be blocked while HTTPS works
+7. Optional satellites (default none). Wired on the router side for switch localization; Wi‑Fi = `intermittent`
 
-## Dumb switches
+## Unmanaged switches
 
-They have **no IP**. Never put the switch in the config. Put 1–2 stable devices *behind* it. If those die together while the router answers, the report blames that **branch**.
+No IP → never in config. Put 1–2 always-on devices **behind** each switch you care about, each in its own group id.
 
-## Probe behind the switch (NAS case)
-
-If netdiag runs on a host plugged into a switch that uplinks to the router:
+## Probe behind a dumb switch
 
 | Pattern | Meaning |
 |---------|---------|
-| `same_segment` up, router/mesh/internet down | `UPLINK_DOWN` — wall cable / router LAN port |
-| `same_segment` + router down (or NIC carrier down) | `PROBE_ISOLATED` — local switch / NIC / cable |
-| Only one group down | `BRANCH` / `SINGLE_HOST` |
+| same_segment up, router down | Uplink cable / path from that switch to the router |
+| same_segment + router down (or NIC carrier down) | Local switch / NIC / cable |
+| Only one named group down | That spur’s switch/cable |
 
-A wired satellite on the **router** side makes this much clearer.
+A **wired satellite on the router** turns those guesses into **confirmed** locations. Wi‑Fi satellites do not localize dumb switches.
 
-## Wi‑Fi satellite
+## Satellite presence
 
-Set `vantage.link: wifi` on that host and list it under coordinator `satellites:`. If the Wi‑Fi satellite goes **silent or lossy** while ethernet vantages stay healthy, expect **`WIFI_PATH`**. Silence is evidence — the satellite may drop exactly when Wi‑Fi fails.
+| State | Meaning |
+|-------|---------|
+| never_seen | Listed but never checked in — ignored |
+| online | Fresh sample |
+| stale | Recently silent — may be a path fault if `always` or corroborated |
+| offline | Graceful goodbye or long silence — parked, not WIFI_PATH |
 
 ## Roles
 
-| Role | Meaning |
-|------|---------|
-| `gateway` | Main router |
-| `mesh` | Mesh node / AP |
-| `branch` | Devices representing a wired spur |
-| `same_segment` | Other device on the probe's local switch |
-| `wifi` | Optional Wi‑Fi client canary |
-| `external` | Internet targets |
-| `other` | Anything else |
-
-Group `id` values are labels you invent (`mesh_a`, `wired_office`, …).
+`gateway`, `mesh`, `branch` (room/spur), `same_segment`, `wifi`, `external`, `other`.

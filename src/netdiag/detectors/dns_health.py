@@ -12,6 +12,7 @@ def dns_check(
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     timeout_s = max(0.5, timeout_ms / 1000.0)
+    dig_time = max(1, int(round(timeout_s)))
     for resolver in resolvers or ["127.0.0.1"]:
         for name in names or ["example.com"]:
             t0 = time.time()
@@ -20,7 +21,14 @@ def dns_check(
             answer = ""
             try:
                 proc = subprocess.run(
-                    ["dig", f"@{resolver}", name, "+short", "+time=1", "+tries=1"],
+                    [
+                        "dig",
+                        f"@{resolver}",
+                        name,
+                        "+short",
+                        f"+time={dig_time}",
+                        "+tries=1",
+                    ],
                     capture_output=True,
                     text=True,
                     timeout=timeout_s + 1,

@@ -6,17 +6,25 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .classify import classify_detector_event, classify_loss, vantage_flags
+from .classify import (
+    ClassResult,
+    classify_detector_event,
+    classify_loss,
+    host_down,
+    resolve_satellite_states,
+)
 from .config import Config, data_dir, load_config
 from .detectors.arp_watch import ArpWatch
+from .detectors.bcast_rate import BcastRateWatch
 from .detectors.dhcp_watch import DhcpWatch
 from .detectors.dns_health import dns_check
 from .detectors.iface_counters import delta, read_carrier, read_counters
-from .detectors.path_check import traceroute_path
-from .detectors.ping_matrix import ping_round
+from .detectors.path_check import run_path_checks_async
+from .detectors.ping_matrix import ping_round, tcp_probe
 from .ingest import start_ingest
-from .report import append_event, matching_pcap, write_reports, write_status
+from .report import append_event, matching_pcap, rotate_events_log, write_reports, write_status
 from .store import Store
+from .timeutil import display_ts, utcnow, utcnow_iso
 
 
 class Analyzer:
@@ -28,13 +36,25 @@ class Analyzer:
         self.logs.mkdir(parents=True, exist_ok=True)
         self.caps.mkdir(parents=True, exist_ok=True)
         self.store = Store(self.logs / "netdiag.db")
-        self.started = datetime.now()
-        self.started_s = self.started.strftime("%Y-%m-%d %H:%M:%S")
-        self.stats: dict[str, dict[str, int]] = {
-            h: {"rounds": 0, "bad": 0, "lost": 0, "sent": 0} for h in cfg.hosts()
+        self.started = utcnow()
+        self.started_s = display_ts(self.started, cfg.timezone)
+        self.stats: dict[str, dict[str, Any]] = {
+            h: {
+                "rounds": 0,
+                "bad": 0,
+                "lost": 0,
+                "sent": 0,
+                "fail_streak": 0,
+                "rtt_sum": 0.0,
+                "rtt_n": 0,
+                "rtt_max": 0.0,
+            }
+            for h in cfg.hosts()
         }
         self.open_inc: dict[str, Any] | None = None
         self.clear_since: float | None = None
+        self.pending_kind: str | None = None
+        self.pending_rounds = 0
         self.base_counters = read_counters(cfg.iface)
         self.round_counters = dict(self.base_counters)
         self.last_dns = 0.0
@@ -42,37 +62,90 @@ class Analyzer:
         self.last_report = 0.0
         self.last_dns_results: list[dict[str, Any]] = []
         self.last_paths: list[dict[str, Any]] = []
-        self.dhcp_alarms: list[str] = []
-        self.arp_alarms: list[str] = []
-        self.dhcp = DhcpWatch(cfg.iface, cfg.expected_dhcp_mac, on_alarm=self._on_dhcp)
+        self.path_baselines: dict[str, list[str]] = {}
+        self.last_speed: int | None = None
+        self.iface_ok = (Path("/sys/class/net") / cfg.iface).exists()
+        self.health_notes: list[str] = []
+        self.open_detectors: dict[str, int] = {}  # identity -> incident id
+
+        learned = self.store.get_kv("dhcp_expected_mac", cfg.expected_dhcp_mac)
+        self.dhcp = DhcpWatch(
+            cfg.iface,
+            learned or cfg.expected_dhcp_mac,
+            on_alarm=self._on_dhcp,
+            on_learned=self._on_dhcp_learned,
+        )
         self.arp = ArpWatch(cfg.iface, on_conflict=self._on_arp)
+        self.bcast = BcastRateWatch(cfg.iface)
+
+        for s in cfg.satellites:
+            self.store.ensure_satellite_row(
+                s.id, s.link, s.resolved_availability()
+            )
+
+        if not self.iface_ok:
+            self.health_notes.append(
+                f"ERROR: interface '{cfg.iface}' not found under /sys/class/net — "
+                "counters/capture/DHCP/ARP will be dead; fix IFACE."
+            )
+        if cfg.vantage.link == "ethernet" and not cfg.hosts_by_role("same_segment"):
+            self.health_notes.append(
+                "WARNING: no same_segment canary — cannot tell local-switch failure from "
+                "uplink-to-router failure on this ethernet probe."
+            )
+
+    def _on_dhcp_learned(self, mac: str) -> None:
+        self.store.set_kv("dhcp_expected_mac", mac)
+        print(f"learned DHCP server MAC {mac}", flush=True)
 
     def _on_dhcp(self, mac: str, msg: str) -> None:
-        self.dhcp_alarms.append(msg)
-        path = self.logs / "ALARM-dhcp.log"
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(f"{datetime.now().isoformat()} {msg}\n")
-        self._detector_incident("ROGUE_DHCP", msg, meta={"mac": mac})
+        self._coalesced_detector("ROGUE_DHCP", mac, msg, meta={"mac": mac})
 
-    def _on_arp(self, ip: str, old: str, new: str) -> None:
-        msg = f"IP conflict / ARP flip: {ip} was {old}, now {new}"
-        self.arp_alarms.append(msg)
-        self._detector_incident("IP_CONFLICT", msg, meta={"ip": ip, "old": old, "new": new})
+    def _on_arp(self, ip: str, a: str, b: str) -> None:
+        msg = f"IP conflict: {ip} claimed by {a} and {b} within a short window"
+        self._coalesced_detector("IP_CONFLICT", ip, msg, meta={"ip": ip, "macs": [a, b]})
 
-    def _detector_incident(self, kind: str, verdict: str, meta: dict | None = None) -> None:
-        cr = classify_detector_event(kind, verdict)
-        pcap = matching_pcap(self.caps, datetime.now())
+    def _coalesced_detector(
+        self, kind: str, identity: str, verdict: str, meta: dict | None = None
+    ) -> None:
+        key = f"{kind}:{identity}"
+        if key in self.open_detectors:
+            self.store.update_incident(
+                self.open_detectors[key],
+                verdict=verdict,
+                meta=meta or {},
+            )
+            return
+        if self.store.recently_closed(kind, key, self.cfg.incident_clear_s):
+            return
+        existing = self.store.find_open_by_identity(kind, key)
+        if existing:
+            self.open_detectors[key] = existing
+            return
+        pcap = matching_pcap(self.caps, utcnow())
         iid = self.store.open_incident(
-            cr.kind, cr.verdict, {}, meta=meta, pcap=pcap, vantage_summary=self._vantage_summary_text()
+            kind,
+            verdict,
+            {},
+            meta=meta,
+            pcap=pcap,
+            vantage_summary=self._vantage_summary_text(),
+            identity_key=key,
         )
-        self.store.close_incident(iid)
+        self.open_detectors[key] = iid
         block = (
-            f"\n=== {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  [{cr.kind}]\n"
-            f"  Verdacht:  {cr.verdict}\n"
+            f"\n=== {display_ts(utcnow_iso(), self.cfg.timezone)}  [{kind}]\n"
+            f"  Verdict:  {verdict}\n"
             f"  pcap:      {pcap or '(none)'}\n"
         )
         append_event(block)
         print(block, flush=True)
+
+    def _clear_detector_if_ok(self, kind: str, identity: str) -> None:
+        key = f"{kind}:{identity}"
+        iid = self.open_detectors.pop(key, None)
+        if iid:
+            self.store.close_incident(iid)
 
     def run(self) -> None:
         print(
@@ -80,9 +153,13 @@ class Analyzer:
             f"({len(self.cfg.hosts())} canaries)",
             flush=True,
         )
+        for note in self.health_notes:
+            print(note, flush=True)
         start_ingest(self.cfg, self.store)
-        self.dhcp.start()
-        self.arp.start()
+        if self.iface_ok:
+            self.dhcp.start()
+            self.arp.start()
+            self.bcast.start()
         try:
             while True:
                 t0 = time.time()
@@ -92,124 +169,225 @@ class Analyzer:
         finally:
             self.dhcp.stop()
             self.arp.stop()
+            self.bcast.stop()
 
     def _tick(self) -> None:
-        ping = ping_round(self.cfg.hosts())
+        ping = ping_round(self.cfg.hosts(), iface=self.cfg.iface)
+        # ICMP fallback for external canaries
+        for h in self.cfg.hosts_by_role("external"):
+            p = ping.get(h) or {}
+            if host_down(p, 100):
+                gw_ok = any(
+                    not host_down(ping.get(g), self.cfg.loss_threshold_pct)
+                    for g in self.cfg.hosts_by_role("gateway")
+                )
+                if gw_ok and tcp_probe(h, 443):
+                    ping[h] = {
+                        "sent": 3,
+                        "recv": 3,
+                        "loss": 0,
+                        "note": "icmp_lost_tcp443_ok",
+                    }
+
         counters = read_counters(self.cfg.iface)
         carrier = read_carrier(self.cfg.iface)
         dlt = delta(self.round_counters, counters)
         self.round_counters = counters
+        bcast = self.bcast.tick() if self.iface_ok else {"pps": 0, "baseline": 0, "storm": 0}
 
-        lost_now = set()
+        speed = carrier.get("speed")
+        if isinstance(speed, int) and speed > 0:
+            if self.last_speed and speed < self.last_speed:
+                note = f"NIC speed dropped {self.last_speed} → {speed} Mb/s on {self.cfg.iface}"
+                self.health_notes.append(note)
+                append_event(f"\n=== {display_ts(utcnow_iso(), self.cfg.timezone)}  [NIC_SPEED]\n  Verdict:  {note}\n")
+            self.last_speed = speed
+
+        lost_now: set[str] = set()
         for host, st in self.stats.items():
             st["rounds"] += 1
             p = ping.get(host) or {"sent": 0, "recv": 0, "loss": 100}
             st["sent"] += int(p.get("sent", 0))
             st["lost"] += int(p.get("sent", 0)) - int(p.get("recv", 0))
-            if int(p.get("loss", 100)) >= 100 or int(p.get("recv", 0)) == 0:
+            rtt = p.get("rtt_avg")
+            if isinstance(rtt, (int, float)):
+                st["rtt_sum"] += float(rtt)
+                st["rtt_n"] += 1
+                st["rtt_max"] = max(float(st["rtt_max"]), float(p.get("rtt_max") or rtt))
+            down = host_down(p, self.cfg.loss_threshold_pct)
+            if down:
+                st["fail_streak"] += 1
                 st["bad"] += 1
+            else:
+                st["fail_streak"] = 0
+            if st["fail_streak"] >= self.cfg.fail_rounds:
                 lost_now.add(host)
 
-        self._append_csv("ping", ping)
+        self._append_csv(ping)
         self._append_iface_csv(counters, carrier)
 
         now = time.time()
+        warmup = (now - self.started.timestamp()) < self.cfg.warmup_s
+
         if now - self.last_dns >= self.cfg.dns_interval_s:
             self.last_dns_results = dns_check(
                 self.cfg.dns_resolvers, self.cfg.dns_names, self.cfg.dns_timeout_ms
             )
             self.last_dns = now
-            fails = [r for r in self.last_dns_results if not r.get("ok")]
-            if fails and len(fails) == len(self.last_dns_results):
-                self._detector_incident(
-                    "DNS_FAILURE",
-                    "All configured DNS checks failed. Suspect router DNS/resolver or upstream DNS.",
-                    meta={"results": fails[:6]},
-                )
+            self._eval_dns(ping)
 
         if now - self.last_path >= self.cfg.path_interval_s:
-            self.last_paths = []
+            targets = []
             for role in ("gateway", "external"):
-                for h in list(self.cfg.hosts_by_role(role))[:1]:
-                    self.last_paths.append(traceroute_path(h))
+                targets.extend(list(self.cfg.hosts_by_role(role))[:1])
+            run_path_checks_async(targets, self.cfg.iface, self._on_paths)
             self.last_path = now
 
-        bcast_pps = 0.0
-        # approximate from multicast counter delta / interval
-        if self.cfg.ping_interval_s > 0:
-            bcast_pps = dlt.get("multicast", 0) / self.cfg.ping_interval_s
-        if bcast_pps >= self.cfg.bcast_pps_warn and lost_now:
-            # annotate open incident via meta; also standalone if severe
-            pass
-
         sat_rows = self.store.list_satellites()
-        flags = vantage_flags(self.cfg, sat_rows, ping, now)
+        sat_states = resolve_satellite_states(self.cfg, sat_rows, now)
+        # Persist computed states for always-listed never_seen rows
+        for s in self.cfg.satellites:
+            self.store.ensure_satellite_row(s.id, s.link, s.resolved_availability())
+
         same_seg = self.cfg.hosts_by_role("same_segment")
         same_down = bool(same_seg) and same_seg <= lost_now
-        carrier_down = carrier.get("carrier") == 0 or carrier.get("operstate") in ("down", "lowerlayerdown")
+        carrier_down = carrier.get("carrier") == 0 or carrier.get("operstate") in (
+            "down",
+            "lowerlayerdown",
+        )
         link_err = dlt.get("rx_errors", 0) + dlt.get("rx_crc_errors", 0)
 
-        result = classify_loss(
-            self.cfg,
-            lost_now,
-            same_segment_down=same_down,
-            carrier_down=carrier_down,
-            link_errors_delta=link_err,
-            bcast_delta=dlt.get("multicast", 0),
-            wifi_vantages_bad=flags["wifi_vantages_bad"],
-            ethernet_vantages_ok=flags["ethernet_vantages_ok"],
-        )
-
-        if link_err > 0 and not self.open_inc:
-            # soft note via status; hard incident if sustained with loss
-            if lost_now:
-                result = result or classify_detector_event(
-                    "LINK_ERRORS",
-                    f"Probe NIC saw +{link_err} receive/CRC errors with concurrent canary loss. "
-                    "Suspect cable, port, or duplex issue on this host's link.",
-                )
-
-        if bcast_pps >= self.cfg.bcast_pps_warn * 5 and lost_now:
-            result = classify_detector_event(
-                "BCAST_STORM",
-                f"Very high multicast/broadcast rate (~{bcast_pps:.0f}/s) with canary loss. "
-                "Suspect loop or storm.",
+        result = None
+        if not warmup:
+            result = classify_loss(
+                self.cfg,
+                lost_now,
+                local_ping=ping,
+                sat_states=sat_states,
+                same_segment_down=same_down,
+                carrier_down=carrier_down,
+                warmup=warmup,
+                loss_threshold_pct=self.cfg.loss_threshold_pct,
             )
 
-        self._update_incident(result, lost_now, dlt, flags)
+        annotations: list[str] = []
+        if link_err > 0:
+            annotations.append(f"+{link_err} NIC receive/CRC errors this interval")
+        if bcast.get("storm"):
+            annotations.append(
+                f"broadcast/multicast pps={bcast['pps']:.0f} (baseline≈{bcast['baseline']:.0f})"
+            )
+        if result and annotations:
+            result.annotations.extend(annotations)
+            result.verdict = result.verdict + " " + "; ".join(annotations) + "."
+        elif not result and annotations and link_err > 0 and not lost_now:
+            # standalone LINK_ERRORS only with no topology pattern
+            result = classify_detector_event(
+                "LINK_ERRORS",
+                f"Probe NIC saw +{link_err} receive/CRC errors without a clear topology loss pattern.",
+            )
+        elif not result and bcast.get("storm") and not lost_now:
+            result = classify_detector_event(
+                "BCAST_STORM",
+                f"Broadcast/multicast rate elevated (pps={bcast['pps']:.0f}, baseline≈{bcast['baseline']:.0f}) "
+                "without canary loss.",
+            )
+
+        self._update_incident(result, lost_now, dlt, sat_states)
 
         if now - self.last_report >= self.cfg.report_interval_s:
-            self._write_outputs(ping, counters, carrier, sat_rows, flags)
+            self._write_outputs(ping, counters, carrier, sat_states, bcast)
+            rotate_events_log(self.logs)
             self.last_report = now
+
+    def _eval_dns(self, ping: dict[str, dict[str, Any]]) -> None:
+        fails = [r for r in self.last_dns_results if not r.get("ok")]
+        if not fails or len(fails) < max(1, len(self.last_dns_results) // 2):
+            for r in self.cfg.dns_resolvers:
+                self._clear_detector_if_ok("DNS_FAILURE", r)
+            return
+        # If resolver IP itself is unreachable, that is uplink/router — not DNS
+        for r in fails:
+            resolver = r["resolver"]
+            if host_down(ping.get(resolver), self.cfg.loss_threshold_pct):
+                continue
+            self._coalesced_detector(
+                "DNS_FAILURE",
+                resolver,
+                f"DNS resolver {resolver} failing lookups while the resolver IP is still reachable.",
+                meta={"results": [r]},
+            )
+
+    def _on_paths(self, results: list[dict[str, Any]]) -> None:
+        self.last_paths = results
+        for r in results:
+            target = r.get("target")
+            hops = [h for h in (r.get("hops") or []) if h and h != "*"]
+            if not target or len(hops) < 1:
+                continue
+            prev = self.path_baselines.get(target)
+            if prev is None:
+                self.path_baselines[target] = hops
+                continue
+            if hops != prev:
+                msg = f"Path to {target} changed: {' → '.join(prev)}  =>  {' → '.join(hops)}"
+                self._coalesced_detector("PATH_CHANGE", target, msg, meta={"old": prev, "new": hops})
+                self.path_baselines[target] = hops
 
     def _update_incident(
         self,
-        result,
+        result: ClassResult | None,
         lost_now: set[str],
         dlt: dict[str, int],
-        flags: dict[str, bool],
+        sat_states: list[dict[str, Any]],
     ) -> None:
         if result:
+            # confirmation hysteresis for ping classes
+            if result.kind not in (
+                "ROGUE_DHCP",
+                "IP_CONFLICT",
+                "DNS_FAILURE",
+                "LINK_ERRORS",
+                "BCAST_STORM",
+                "PATH_CHANGE",
+            ):
+                if self.pending_kind == result.kind:
+                    self.pending_rounds += 1
+                else:
+                    self.pending_kind = result.kind
+                    self.pending_rounds = 1
+                if self.pending_rounds < self.cfg.confirm_rounds and not self.open_inc:
+                    return
+
             self.clear_since = None
             if not self.open_inc:
-                pcap = matching_pcap(self.caps, datetime.now())
+                pcap = matching_pcap(self.caps, utcnow())
                 hosts = {h: 1 for h in lost_now}
+                meta = {
+                    "delta": dlt,
+                    "matrix": result.matrix,
+                    "confidence": result.confidence,
+                    "annotations": result.annotations,
+                }
                 iid = self.store.open_incident(
                     result.kind,
                     result.verdict,
                     hosts,
-                    meta={"delta": dlt, "flags": flags},
+                    meta=meta,
                     pcap=pcap,
                     vantage_summary=self._vantage_summary_text(),
+                    where_text=result.where_text,
+                    identity_key=f"ping:{result.kind}",
                 )
                 self.open_inc = {
                     "id": iid,
                     "kind": result.kind,
                     "verdict": result.verdict,
+                    "where_text": result.where_text,
                     "hosts": hosts,
-                    "start": datetime.now(),
-                    "delta0": dict(self.base_counters),
+                    "start": utcnow(),
                     "counters0": read_counters(self.cfg.iface),
+                    "matrix": result.matrix,
                 }
                 print(f"incident open [{result.kind}] id={iid}", flush=True)
             else:
@@ -217,15 +395,20 @@ class Analyzer:
                     self.open_inc["hosts"][h] = self.open_inc["hosts"].get(h, 0) + 1
                 self.open_inc["kind"] = result.kind
                 self.open_inc["verdict"] = result.verdict
+                self.open_inc["where_text"] = result.where_text
+                self.open_inc["matrix"] = result.matrix
                 self.store.update_incident(
                     self.open_inc["id"],
                     kind=result.kind,
                     verdict=result.verdict,
                     hosts=self.open_inc["hosts"],
-                    meta={"delta": dlt, "flags": flags},
+                    meta={"delta": dlt, "matrix": result.matrix, "confidence": result.confidence},
                     vantage_summary=self._vantage_summary_text(),
+                    where_text=result.where_text,
                 )
         else:
+            self.pending_kind = None
+            self.pending_rounds = 0
             if self.open_inc:
                 if self.clear_since is None:
                     self.clear_since = time.time()
@@ -240,21 +423,19 @@ class Analyzer:
         crc = dlt.get("rx_crc_errors", 0) + dlt.get("rx_errors", 0)
         extra = ""
         if crc > 0:
-            extra += (
-                f" During the incident +{crc} receive/CRC errors on {self.cfg.iface} "
-                "(physical/link hint)."
-            )
+            extra += f" During the incident +{crc} receive/CRC errors on {self.cfg.iface}."
         if dlt.get("multicast", 0) > 5000:
-            extra += f" +{dlt['multicast']} multicast frames during the window (storm hint)."
+            extra += f" +{dlt['multicast']} multicast counter delta during the window."
         verdict = self.open_inc["verdict"] + extra
         pcap = matching_pcap(self.caps, self.open_inc["start"])
         self.store.update_incident(
             iid,
             verdict=verdict,
             hosts=self.open_inc["hosts"],
-            meta={"delta": dlt},
+            meta={"delta": dlt, "matrix": self.open_inc.get("matrix")},
             pcap=pcap,
             vantage_summary=self._vantage_summary_text(),
+            where_text=self.open_inc.get("where_text") or "",
         )
         self.store.close_incident(iid)
         hosts = ", ".join(
@@ -262,10 +443,11 @@ class Analyzer:
             for h, n in sorted(self.open_inc["hosts"].items(), key=lambda x: -x[1])
         )
         block = (
-            f"\n=== {self.open_inc['start'].strftime('%Y-%m-%d %H:%M:%S')}  "
+            f"\n=== {display_ts(self.open_inc['start'], self.cfg.timezone)}  "
             f"[{self.open_inc['kind']}]  closed\n"
-            f"  Affected: {hosts or '(detector only)'}\n"
+            f"  Affected: {hosts or '(detector)'}\n"
             f"  Verdict:  {verdict}\n"
+            f"  Where:    {self.open_inc.get('where_text') or 'n/a'}\n"
             f"  pcap:      {pcap or '(none)'}\n"
         )
         append_event(block)
@@ -278,20 +460,25 @@ class Analyzer:
         return g.id if g else "?"
 
     def _vantage_summary_text(self) -> str:
-        lines = [f"local={self.cfg.vantage.id}/{self.cfg.vantage.link}"]
-        for row in self.store.list_satellites():
-            lines.append(f"{row['vantage_id']}/{row.get('link')} last={row.get('received_at')}")
-        return "; ".join(lines)
+        now = time.time()
+        states = resolve_satellite_states(self.cfg, self.store.list_satellites(), now)
+        parts = [f"local={self.cfg.vantage.id}/{self.cfg.vantage.link}/online"]
+        for s in states:
+            parts.append(
+                f"{s['vantage_id']}/{s.get('link')}/{s.get('state')}"
+                f"(avail={s.get('availability')}, last={s.get('received_at') or 'never'})"
+            )
+        return "; ".join(parts)
 
-    def _append_csv(self, kind: str, ping: dict[str, dict[str, Any]]) -> None:
-        day = datetime.now().strftime("%Y-%m-%d")
+    def _append_csv(self, ping: dict[str, dict[str, Any]]) -> None:
+        day = utcnow().strftime("%Y-%m-%d")
         path = self.logs / f"ping-{day}.csv"
         new = not path.exists()
         with path.open("a", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
             if new:
-                w.writerow(["ts", "host", "sent", "recv", "loss", "rtt_avg"])
-            ts = datetime.now().isoformat(timespec="seconds")
+                w.writerow(["ts", "host", "sent", "recv", "loss", "rtt_avg", "note"])
+            ts = utcnow_iso()
             for host, p in ping.items():
                 w.writerow(
                     [
@@ -301,11 +488,12 @@ class Analyzer:
                         p.get("recv"),
                         p.get("loss"),
                         p.get("rtt_avg", ""),
+                        p.get("note", ""),
                     ]
                 )
 
     def _append_iface_csv(self, counters: dict[str, int], carrier: dict[str, Any]) -> None:
-        day = datetime.now().strftime("%Y-%m-%d")
+        day = utcnow().strftime("%Y-%m-%d")
         path = self.logs / f"iface-{day}.csv"
         new = not path.exists()
         with path.open("a", newline="", encoding="utf-8") as fh:
@@ -315,7 +503,7 @@ class Analyzer:
                 w.writerow(["ts", "operstate", "carrier", "speed", *keys])
             w.writerow(
                 [
-                    datetime.now().isoformat(timespec="seconds"),
+                    utcnow_iso(),
                     carrier.get("operstate"),
                     carrier.get("carrier"),
                     carrier.get("speed"),
@@ -328,13 +516,14 @@ class Analyzer:
         ping: dict[str, dict[str, Any]],
         counters: dict[str, int],
         carrier: dict[str, Any],
-        sat_rows: list[dict[str, Any]],
-        flags: dict[str, bool],
+        sat_states: list[dict[str, Any]],
+        bcast: dict[str, float],
     ) -> None:
         host_stats = []
         for h, st in self.stats.items():
             g = self.cfg.group_for_host(h)
             loss_pct = (100.0 * st["lost"] / st["sent"]) if st["sent"] else 0.0
+            rtt_avg = (st["rtt_sum"] / st["rtt_n"]) if st["rtt_n"] else None
             host_stats.append(
                 {
                     "host": h,
@@ -342,63 +531,73 @@ class Analyzer:
                     "rounds": st["rounds"],
                     "bad": st["bad"],
                     "loss_pct": loss_pct,
+                    "rtt_avg": rtt_avg,
+                    "rtt_max": st["rtt_max"] or None,
                 }
             )
         host_stats.sort(key=lambda r: -r["loss_pct"])
 
         sats = []
-        now = time.time()
-        expected = {s.id: s.link for s in self.cfg.satellites}
-        seen = {r["vantage_id"]: r for r in sat_rows}
-        for vid, link in expected.items():
-            row = seen.get(vid)
-            if not row:
-                sats.append({"id": vid, "link": link, "last_seen": "never", "status": "missing"})
-                continue
-            age = _age(row.get("received_at"), now)
-            status = "ok"
-            if age is None or age > self.cfg.satellite_stale_s:
-                status = "silent"
+        for s in sat_states:
+            state = s.get("state", "never_seen")
             sats.append(
                 {
-                    "id": vid,
-                    "link": row.get("link") or link,
-                    "last_seen": row.get("received_at"),
-                    "status": status,
-                }
-            )
-        for row in sat_rows:
-            if row["vantage_id"] in expected:
-                continue
-            age = _age(row.get("received_at"), now)
-            sats.append(
-                {
-                    "id": row["vantage_id"],
-                    "link": row.get("link"),
-                    "last_seen": row.get("received_at"),
-                    "status": "ok" if age is not None and age <= self.cfg.satellite_stale_s else "silent",
+                    "id": s["vantage_id"],
+                    "link": s.get("link"),
+                    "availability": s.get("availability"),
+                    "last_seen": display_ts(s.get("received_at"), self.cfg.timezone)
+                    if s.get("received_at")
+                    else "never",
+                    "status": state,
+                    "warn": state in ("stale", "fault"),
                 }
             )
 
         incidents = self.store.list_incidents(200)
-        by_kind: dict[str, int] = {}
+        # hottest by duration * recency weight, not raw count
+        scores: dict[str, float] = {}
+        now = utcnow().timestamp()
         for inc in incidents:
-            by_kind[inc["kind"]] = by_kind.get(inc["kind"], 0) + 1
+            kind = inc["kind"]
+            try:
+                start = datetime.strptime(inc["start"], "%Y-%m-%dT%H:%M:%SZ").timestamp()
+            except Exception:
+                start = now
+            end = now
+            if inc.get("end"):
+                try:
+                    end = datetime.strptime(inc["end"], "%Y-%m-%dT%H:%M:%SZ").timestamp()
+                except Exception:
+                    pass
+            dur = max(1.0, end - start)
+            age_h = max(0.1, (now - end) / 3600.0)
+            scores[kind] = scores.get(kind, 0.0) + dur / age_h
+        by_kind = sorted(scores.items(), key=lambda x: -x[1])
+
         if by_kind:
-            top = max(by_kind.items(), key=lambda x: x[1])
-            summary = f"Hottest class so far: {top[0]} ({top[1]}x). See incidents below."
+            summary = f"Hottest suspect (duration×recency): {by_kind[0][0]}."
         else:
-            summary = "No incidents yet. Either the network is quiet, or canaries do not cover the failing path."
-        if flags.get("wifi_vantages_bad") and flags.get("ethernet_vantages_ok"):
-            summary += " Wi-Fi vantage trouble with healthy ethernet — watch for WIFI_PATH."
+            summary = "No incidents yet."
+        if self.health_notes:
+            summary += " " + self.health_notes[-1]
+
+        from .classify import build_vantage_matrix
+
+        matrix = build_vantage_matrix(
+            self.cfg, ping, sat_states, self.cfg.loss_threshold_pct
+        )
 
         dlt = delta(self.base_counters, counters)
         iface_text = (
-            f"iface={self.cfg.iface} operstate={carrier.get('operstate')} "
-            f"carrier={carrier.get('carrier')} speed={carrier.get('speed')}\n"
+            f"iface={self.cfg.iface} exists={self.iface_ok} "
+            f"operstate={carrier.get('operstate')} carrier={carrier.get('carrier')} "
+            f"speed={carrier.get('speed')}\n"
             f"deltas since start: {dlt}\n"
-            f"flags: {flags}\n"
+            f"bcast pps={bcast.get('pps'):.1f} baseline≈{bcast.get('baseline'):.1f}\n"
+            f"canaries={len(self.cfg.hosts())} satellites={len(sat_states)}\n"
         )
+        for n in self.health_notes[-5:]:
+            iface_text += n + "\n"
 
         write_reports(
             self.cfg,
@@ -408,53 +607,45 @@ class Analyzer:
             satellites=sats,
             iface_text=iface_text,
             summary_text=summary,
+            by_kind_weighted=by_kind,
+            matrix=matrix,
         )
 
-        # STATUS.txt
         lines = [
             "NETDIAG STATUS",
-            f"generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"generated: {display_ts(utcnow_iso(), self.cfg.timezone)}",
             f"running since: {self.started_s}",
             f"vantage: {self.cfg.vantage.id} ({self.cfg.vantage.link})",
+            f"iface: {self.cfg.iface} ok={self.iface_ok}",
             "",
-            "--- INCIDENTS ---",
+            "--- HEALTH ---",
         ]
+        lines.extend(f"  {n}" for n in (self.health_notes or ["  ok"]))
+        lines += ["", "--- INCIDENTS (weighted) ---"]
         if not by_kind:
             lines.append("  none yet")
         else:
-            for k, n in sorted(by_kind.items(), key=lambda x: -x[1]):
-                lines.append(f"  {k:16} {n:3}x")
-        lines.append("")
-        lines.append("--- CANARY LOSS % ---")
+            for k, score in by_kind[:10]:
+                lines.append(f"  {k:16} score={score:.0f}")
+        lines += ["", "--- CANARY LOSS % ---"]
         for row in host_stats[:20]:
+            rtt = f" rtt≈{row['rtt_avg']:.1f}ms" if row.get("rtt_avg") is not None else ""
             lines.append(
-                f"  {row['host']:18} {row['group']:16} {row['loss_pct']:6.2f}%"
+                f"  {row['host']:18} {row['group']:16} {row['loss_pct']:6.2f}%{rtt}"
             )
-        lines.append("")
-        lines.append("--- SATELLITES ---")
+        lines += ["", "--- SATELLITES ---"]
         if not sats:
-            lines.append("  (none)")
+            lines.append("  (none configured)")
         for s in sats:
-            lines.append(f"  {s['id']:16} {s['link']:10} {s['status']:8} {s['last_seen']}")
-        lines.append("")
-        lines.append("--- NIC ---")
-        lines.append(f"  {iface_text.strip()}")
+            lines.append(
+                f"  {s['id']:16} {s['link']:10} {s['status']:12} "
+                f"avail={s.get('availability')} last={s['last_seen']}"
+            )
+        lines += ["", "--- NIC ---", f"  {iface_text.strip()}"]
         if self.open_inc:
-            lines.append("")
-            lines.append(f"OPEN INCIDENT: {self.open_inc['kind']} id={self.open_inc['id']}")
+            lines += ["", f"OPEN INCIDENT: {self.open_inc['kind']} id={self.open_inc['id']}"]
+            lines.append(f"  Where: {self.open_inc.get('where_text')}")
         write_status("\n".join(lines) + "\n")
-
-
-def _age(received_at: str | None, now_ts: float) -> float | None:
-    if not received_at:
-        return None
-    try:
-        from datetime import timezone
-
-        dt = datetime.strptime(received_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        return now_ts - dt.timestamp()
-    except Exception:
-        return None
 
 
 def run_analyzer(config_path: str | None = None) -> None:

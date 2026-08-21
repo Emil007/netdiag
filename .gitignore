@@ -1,6 +1,7 @@
 config.yaml
 config.satellite.yaml
 .env
+review_feedback.md
 data/
 __pycache__/
 *.py[cod]

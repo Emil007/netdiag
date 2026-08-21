@@ -1,64 +1,68 @@
-# netdiag coordinator — edit this file, pull the image (no local build).
-# Image is built on GitHub Actions: ghcr.io/emil007/netdiag:latest
+# =============================================================================
+# netdiag — coordinator (home LAN diagnostics)
+# =============================================================================
 #
-# Portainer: Stacks → Add stack → paste this YAML → change environment + volume path.
-# Requires Linux Docker host networking (NAS / Pi / Proxmox), not Docker Desktop.
+# What this is:
+#   A Docker Compose stack that runs for days on a Linux host with Docker Engine,
+#   watches a handful of always-on "canary" devices, and writes HTML reports when
+#   something looks broken (bad cable, dying unmanaged switch, rogue DHCP, etc.).
+#
+# Requirements:
+#   - Linux + Docker Engine with host networking (not Docker Desktop on Windows/Mac)
+#   - Capabilities NET_RAW + NET_ADMIN
+#
+# Setup (no wizard):
+#   1. Copy config.example.yaml → config.yaml and edit the commented groups.
+#   2. Edit the environment values below (IFACE, token, …).
+#   3. docker compose up -d
+#      (pulls ghcr.io/emil007/netdiag:latest — built on GitHub; do not build: here
+#       unless you are developing the image yourself)
+#
+# Optional: the same compose file can be pasted into Portainer or any compose UI.
+# Some UIs want an absolute host path for volumes instead of ./data.
+#
+# Image: ghcr.io/emil007/netdiag:latest  (linux/amd64 + linux/arm64)
+# If the pull is unauthorized: docker login ghcr.io  — or make the GHCR package public.
+# =============================================================================
 
 services:
   analyzer:
     image: ghcr.io/emil007/netdiag:latest
     container_name: netdiag-analyzer
+    # Host networking is required so fping/tcpdump see the real LAN.
     network_mode: host
     cap_add:
       - NET_RAW
       - NET_ADMIN
     environment:
+      # Timezone for logs/pcap filenames/display (IANA name).
       TZ: Europe/Berlin
-      # Host NIC that sees the LAN (ip -br link)
+
+      # NIC on THIS Docker host that faces the home LAN.
+      # Find it with: ip -br link
+      # Examples: eth0, enp3s0, wlan0 — do not guess.
       IFACE: eth0
 
-      NETDIAG_SITE_NAME: Home LAN
-      NETDIAG_VANTAGE_ID: coordinator
-      NETDIAG_VANTAGE_LINK: ethernet
-      NETDIAG_VANTAGE_NOTE: main probe host
-
-      # Satellite ingest (LAN only). Token must match satellites.
-      NETDIAG_INGEST_ENABLED: "true"
-      NETDIAG_INGEST_HOST: "0.0.0.0"
-      NETDIAG_INGEST_PORT: "8787"
+      # Ingest token satellites must send. MUST NOT stay "change-me" in real use.
+      # Generate something random. Must match satellite config coordinator.token.
       NETDIAG_INGEST_TOKEN: change-me
 
-      # Expected satellites (JSON). Silence + link type drives WIFI_PATH etc.
-      NETDIAG_SATELLITES: >-
-        [{"id":"pc_router","link":"ethernet"},{"id":"laptop_wifi","link":"wifi"}]
+      # Optional: bind ingest to a specific address (default comes from config.yaml).
+      # Prefer your LAN IP instead of 0.0.0.0 if the host also has WAN/VPN.
+      # NETDIAG_INGEST_HOST: 192.168.1.10
+      # NETDIAG_INGEST_PORT: "8787"
 
-      # Canary groups (JSON) — few always-on probes, not every device. See docs/MAPPING.md
-      NETDIAG_GROUPS: >-
-        [
-          {"id":"router","role":"gateway","hosts":["192.168.1.1"]},
-          {"id":"mesh_a","role":"mesh","hosts":["192.168.1.2"]},
-          {"id":"mesh_b","role":"mesh","hosts":["192.168.1.3"]},
-          {"id":"mesh_c","role":"mesh","hosts":["192.168.1.4"]},
-          {"id":"wired_office","role":"branch","hosts":["192.168.1.10","192.168.1.11"]},
-          {"id":"same_switch_as_probe","role":"same_segment","hosts":["192.168.1.12"]},
-          {"id":"wifi_sample","role":"wifi","hosts":["192.168.1.50"]},
-          {"id":"internet","role":"external","hosts":["1.1.1.1","8.8.8.8"]}
-        ]
-
-      NETDIAG_DNS_RESOLVERS: "192.168.1.1"
-      NETDIAG_DNS_NAMES: "example.com,cloudflare.com,google.com"
-      # Leave empty to learn first DHCP server MAC
-      NETDIAG_DHCP_MAC: ""
-
-      NETDIAG_PING_INTERVAL_S: "5"
-      NETDIAG_INCIDENT_CLEAR_S: "60"
-      NETDIAG_REPORT_INTERVAL_S: "60"
-      NETDIAG_SATELLITE_STALE_S: "45"
+      # Lab only — allows empty/placeholder token (insecure).
+      # NETDIAG_ALLOW_INSECURE_INGEST: "1"
 
       NETDIAG_DATA: /data
+      NETDIAG_CONFIG: /app/config.yaml
     volumes:
-      # Change to an absolute host path in Portainer if relative paths are awkward
+      # Persistent reports, logs, SQLite, captures.
+      # Portainer tip: use an absolute path, e.g. /srv/netdiag/data:/data
       - ./data:/data
+      # Canaries, satellites, roles — edit config.yaml (copy from config.example.yaml).
+      - ./config.yaml:/app/config.yaml:ro
     restart: unless-stopped
 
   capture:
@@ -71,11 +75,11 @@ services:
       - NET_ADMIN
     environment:
       TZ: Europe/Berlin
+      # Must match analyzer IFACE.
       IFACE: eth0
-      NETDIAG_SNAPLEN: "128"
-      NETDIAG_ROTATE_HOURS: "1"
-      NETDIAG_KEEP_HOURS: "48"
       NETDIAG_DATA: /data
+      NETDIAG_CONFIG: /app/config.yaml
     volumes:
       - ./data:/data
+      - ./config.yaml:/app/config.yaml:ro
     restart: unless-stopped

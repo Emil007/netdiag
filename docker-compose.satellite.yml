@@ -1,5 +1,23 @@
-# netdiag satellite — edit this file, pull image (no local build).
-# Same image as coordinator. Set link to ethernet or wifi.
+# =============================================================================
+# netdiag — satellite (optional second vantage)
+# =============================================================================
+#
+# Same published image as the coordinator. Lightweight: ping + NIC stats, no pcap.
+# Pushes samples to the coordinator ingest URL.
+#
+# Typical uses on a home LAN:
+#   - Wired host plugged into the router (availability: always) — confirms
+#     "local switch vs uplink vs router".
+#   - Wi-Fi host (availability: intermittent) — helps WIFI_PATH; may sleep.
+#
+# Setup:
+#   1. Copy config.satellite.example.yaml → config.satellite.yaml and edit.
+#   2. Edit IFACE / token overrides below if needed.
+#   3. docker compose -f docker-compose.satellite.yml up -d
+#
+# Coordinator must list this satellite id under satellites: in its config.yaml
+# (or it will be stored but not used for triangulation until listed).
+# =============================================================================
 
 services:
   satellite:
@@ -12,30 +30,19 @@ services:
       - NET_ADMIN
     environment:
       TZ: Europe/Berlin
-      IFACE: wlan0
 
-      NETDIAG_SITE_NAME: Home LAN
-      NETDIAG_VANTAGE_ID: laptop_wifi
-      NETDIAG_VANTAGE_LINK: wifi
-      NETDIAG_VANTAGE_NOTE: Docker host on Wi-Fi
+      # NIC on THIS satellite host (ip -br link). Use the Wi-Fi NIC if link is wifi.
+      IFACE: eth0
 
-      # Coordinator LAN IP + matching token
-      NETDIAG_COORDINATOR_URL: http://192.168.1.10:8787/ingest
+      # Must match coordinator ingest.token. Not "change-me" in real use.
       NETDIAG_COORDINATOR_TOKEN: change-me
 
-      NETDIAG_GROUPS: >-
-        [
-          {"id":"router","role":"gateway","hosts":["192.168.1.1"]},
-          {"id":"mesh_a","role":"mesh","hosts":["192.168.1.2"]},
-          {"id":"mesh_b","role":"mesh","hosts":["192.168.1.3"]},
-          {"id":"mesh_c","role":"mesh","hosts":["192.168.1.4"]},
-          {"id":"internet","role":"external","hosts":["1.1.1.1","8.8.8.8"]}
-        ]
+      # Optional override if you prefer env over config.satellite.yaml:
+      # NETDIAG_COORDINATOR_URL: http://<coordinator-ip>:8787/ingest
 
-      NETDIAG_DNS_RESOLVERS: "192.168.1.1"
-      NETDIAG_DNS_NAMES: "example.com,cloudflare.com"
-      NETDIAG_PING_INTERVAL_S: "5"
       NETDIAG_DATA: /data
+      NETDIAG_CONFIG: /app/config.yaml
     volumes:
       - ./data:/data
+      - ./config.satellite.yaml:/app/config.yaml:ro
     restart: unless-stopped
