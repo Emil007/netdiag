@@ -21,7 +21,9 @@ from .detectors.iface_counters import EthtoolCrcTracker, delta, read_carrier, re
 from .detectors.l2_bridge import L2BridgeWatch
 from .detectors.path_check import run_path_checks_async
 from .detectors.ping_matrix import ping_round, tcp_probe
+from .bootstrap import seed_status_hub, write_waiting_stubs
 from .ingest import StatusHub, start_ingest
+from .labels import format_kind, kind_label
 from .report import append_event, matching_pcap, rotate_events_log, write_reports, write_status
 from .store import Store
 from .timeutil import display_ts, utcnow, utcnow_iso
@@ -210,6 +212,8 @@ class Analyzer:
         )
         for note in self.health_notes:
             print(note, flush=True)
+        seed_status_hub(self.status_hub, self.cfg)
+        write_waiting_stubs(self.cfg)
         start_ingest(self.cfg, self.store, status_hub=self.status_hub)
         if self.iface_ok:
             self.dhcp.start()
@@ -791,20 +795,32 @@ class Analyzer:
         )
 
         dlt = delta(self.base_counters, counters)
-        iface_text = (
-            f"iface={self.cfg.iface} exists={self.iface_ok} "
-            f"operstate={carrier.get('operstate')} carrier={carrier.get('carrier')} "
-            f"speed={carrier.get('speed')}\n"
+        oper = carrier.get("operstate")
+        speed = carrier.get("speed")
+        if not self.iface_ok:
+            iface_headline = f"Probe NIC {self.cfg.iface} not found — fix IFACE."
+        elif carrier.get("carrier") == 0 or oper in ("down", "lowerlayerdown"):
+            iface_headline = f"Probe NIC {self.cfg.iface} link is down."
+        elif self.link_fault_note and self._link_fault_sticky():
+            iface_headline = self.link_fault_note
+        else:
+            iface_headline = (
+                f"Probe NIC {self.cfg.iface} looks up"
+                + (f" at {speed} Mb/s" if speed else "")
+                + "."
+            )
+        iface_detail = (
+            f"operstate={oper} carrier={carrier.get('carrier')} speed={speed}\n"
             f"deltas since start: {dlt}\n"
             f"bcast pps={l2tick.get('pps', 0):.1f} baseline≈{l2tick.get('baseline', 0):.1f}\n"
-            f"{census_snap.get('text', 'census: n/a')}"
-            f"{' MASS' if census_snap.get('mass_disappear') and self.open_inc else ''}\n"
+            f"{census_snap.get('text', 'no speakers yet')}"
+            f"{' (mass drop while incident open)' if census_snap.get('mass_disappear') and self.open_inc else ''}\n"
             f"canaries={len(self.cfg.hosts())} satellites={len(expected_sats)}\n"
-            "Note: DHCP+ARP+merged L2/bcast live sniff; capture service writes the pcap ring.\n"
-            "L2 live parse uses tcpdump -v; ring snaplen may still truncate BPDUs — see capture.snaplen.\n"
+            "DHCP+ARP+L2 sniff live; capture service writes the pcap ring.\n"
         )
         for n in self.health_notes[-5:]:
-            iface_text += n + "\n"
+            iface_detail += n + "\n"
+        iface_text = iface_headline + "\n\n" + iface_detail
 
         write_reports(
             self.cfg,
@@ -813,11 +829,14 @@ class Analyzer:
             incidents=incidents,
             satellites=sats,
             iface_text=iface_text,
+            iface_headline=iface_headline,
+            iface_detail=iface_detail,
             summary_text=summary,
             by_kind_weighted=by_kind,
             matrix=matrix,
             l2_bridges=l2_list,
             topology=topology,
+            loss_threshold_pct=self.cfg.loss_threshold_pct,
         )
 
         lines = [
@@ -827,11 +846,12 @@ class Analyzer:
             f"vantage: {self.cfg.vantage.id} ({self.cfg.vantage.link})",
             f"iface: {self.cfg.iface} ok={self.iface_ok}",
             f"topology: reports/topology.html",
-            f"{census_snap.get('text', 'census: n/a')}",
+            f"speakers: {census_snap.get('text', 'n/a')}",
             "",
             "--- HEALTH ---",
+            f"  {iface_headline}",
         ]
-        lines.extend(f"  {n}" for n in (self.health_notes or ["ok"]))
+        lines.extend(f"  {n}" for n in (self.health_notes or []))
         lines += ["", "--- L2 BRIDGES OBSERVED ---"]
         if not l2_list:
             lines.append("  none (many unmanaged switches send no STP/LLDP)")
@@ -843,7 +863,7 @@ class Analyzer:
             lines.append("  none yet")
         else:
             for k, score in by_kind[:10]:
-                lines.append(f"  {k:16} score={score:.0f}")
+                lines.append(f"  {format_kind(k):40} score={score:.0f}")
         lines += ["", "--- CANARY LOSS % ---"]
         for row in host_stats[:20]:
             rtt = f" rtt≈{row['rtt_avg']:.1f}ms" if row.get("rtt_avg") is not None else ""
@@ -864,9 +884,9 @@ class Analyzer:
                 f"  {s['id']:16} {s['link']:10} {s['status']:12} "
                 f"avail={s.get('availability')} last={s['last_seen']}"
             )
-        lines += ["", "--- NIC ---", f"  {iface_text.strip()}"]
+        lines += ["", "--- NIC (detail) ---", f"  {iface_detail.strip()}"]
         if self.open_inc:
-            lines += ["", f"OPEN INCIDENT: {self.open_inc['kind']} id={self.open_inc['id']}"]
+            lines += ["", f"OPEN INCIDENT: {format_kind(self.open_inc['kind'])} id={self.open_inc['id']}"]
             lines.append(f"  Where: {self.open_inc.get('where_text')}")
             lines.append(f"  Confidence: {self.open_inc.get('confidence') or 'n/a'}")
         write_status("\n".join(lines) + "\n")
@@ -887,22 +907,26 @@ class Analyzer:
             open_payload = {
                 "id": iid,
                 "kind": self.open_inc.get("kind"),
+                "kind_label": kind_label(self.open_inc.get("kind")),
+                "kind_display": format_kind(self.open_inc.get("kind")),
                 "confidence": self.open_inc.get("confidence") or "single_vantage",
                 "where_text": self.open_inc.get("where_text") or "",
                 "href": href,
             }
         self.status_hub.update(
             {
+                "ready": True,
                 "site": self.cfg.site_name,
                 "generated": display_ts(utcnow_iso(), self.cfg.timezone),
                 "vantage_id": self.cfg.vantage.id,
                 "vantage_link": self.cfg.vantage.link,
                 "open_incident": open_payload,
-                "census_text": census_snap.get("text") or "census: n/a",
+                "census_text": census_snap.get("text") or "no speakers yet",
                 "census": census_snap,
                 "satellites": sats,
                 "health_notes": list(self.health_notes[-5:]),
                 "ingest_locked": locked,
+                "waiting_message": None,
             }
         )
 

@@ -39,16 +39,31 @@ def group_reachability(
     ping: dict[str, dict[str, Any]],
     loss_threshold_pct: int = 50,
 ) -> dict[str, str]:
-    """Per group id: ok | loss | mixed | empty."""
+    """Per group id: ok | loss | mixed | unknown | empty.
+
+    Absent ping keys are unknown — never treated as down. Satellites that only
+    probe a subset of canaries must not confirm BRANCH/SINGLE_HOST as loss.
+    """
     out: dict[str, str] = {}
     for g in cfg.groups:
         if not g.hosts:
             out[g.id] = "empty"
             continue
-        downs = [host_down(ping.get(h), loss_threshold_pct) for h in g.hosts]
-        if all(downs):
+        known_down: list[bool] = []
+        missing = 0
+        for h in g.hosts:
+            if h not in ping:
+                missing += 1
+                continue
+            known_down.append(host_down(ping[h], loss_threshold_pct))
+        if missing:
+            # Incomplete coverage for this group → unknown (do not invent loss/ok)
+            out[g.id] = "unknown"
+        elif not known_down:
+            out[g.id] = "empty"
+        elif all(known_down):
             out[g.id] = "loss"
-        elif not any(downs):
+        elif not any(known_down):
             out[g.id] = "ok"
         else:
             out[g.id] = "mixed"

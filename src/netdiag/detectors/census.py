@@ -76,6 +76,8 @@ class LanCensus:
             "recent": recent,
             "active": active,
             "baseline": baseline,
-            "text": f"census: {active}→{recent}",
+            "text": f"{active}→{recent} speakers (last {int(self.recent_s / 60) or 1} min)"
+            if self.recent_s >= 60
+            else f"{active}→{recent} speakers (last {int(self.recent_s)}s)",
             "mass_disappear": mass,
         }

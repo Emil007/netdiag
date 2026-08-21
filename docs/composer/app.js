@@ -275,15 +275,35 @@ ${indented}
     const url = d.coordIp
       ? `http://${d.coordIp}:8787/ingest`
       : "http://192.168.1.10:8787/ingest";
+    // Mirror ALL coordinator canaries — missing ping keys are treated as unknown, not down.
+    const meshes = readRows(meshRows).filter((r) => r.ip);
+    const branches = readRows(branchRows).filter((r) => r.id && r.hosts);
+    const ext = splitIps(d.externalIps);
+    const wifi = (d.wifiIp || "").trim();
+    let groups = `  - id: router\n    role: gateway\n    hosts: ${yamlList([d.gatewayIp])}\n`;
+    meshes.forEach((m, i) => {
+      groups += `\n  - id: mesh_${i + 1}\n    role: mesh\n    hosts: ${yamlList([m.ip])}\n`;
+    });
+    branches.forEach((b) => {
+      groups += `\n  - id: ${sanitizeBranchId(b.id)}\n    role: branch\n    hosts: ${yamlList(splitIps(b.hosts))}\n`;
+    });
+    if (d.behindSwitch && d.sameSegmentIp) {
+      groups += `\n  - id: same_switch_as_probe\n    role: same_segment\n    hosts: ${yamlList([d.sameSegmentIp])}\n`;
+    }
+    if (wifi) {
+      groups += `\n  - id: wifi_sample\n    role: wifi\n    hosts: ${yamlList([wifi])}\n`;
+    }
+    groups += `\n  - id: internet\n    role: external\n    hosts: ${yamlList(ext.length ? ext : ["1.1.1.1", "8.8.8.8"])}\n`;
+
     const cfg = `site:
   name: "${escYaml(d.siteName)}"
   timezone: ${d.timezone}
 
 vantage:
-  id: ${sat.id}
+  id: ${sanitizeBranchId(sat.id)}
   link: ${sat.link}
   availability: ${sat.availability}
-  note: "satellite vantage"
+  note: "satellite vantage — ping the same canaries as the coordinator"
 
 capture:
   iface: ${sat.iface || d.iface}
@@ -292,14 +312,9 @@ coordinator:
   url: "${escYaml(url)}"
   token: "${escYaml(d.token)}"
 
+# Must mirror coordinator groups (same hosts) for triangulation confidence.
 groups:
-  - id: router
-    role: gateway
-    hosts: ${yamlList([d.gatewayIp])}
-  - id: internet
-    role: external
-    hosts: ${yamlList(splitIps(d.externalIps).length ? splitIps(d.externalIps) : ["1.1.1.1", "8.8.8.8"])}
-
+${groups}
 dns:
   resolvers: ${yamlList([d.gatewayIp])}
   names: ["example.com", "cloudflare.com"]
@@ -311,12 +326,13 @@ thresholds:
 `;
     return `# Generated satellite compose for ${sat.id}
 # List this id under satellites: on the coordinator (placement: ${sat.placement}).
+# After up: status UI on coordinator is http://${d.coordIp || "<coordinator-LAN-IP>"}:8787/
 # docker compose -f docker-compose.satellite.yml up -d
 
 services:
   satellite:
     image: ghcr.io/emil007/netdiag:latest
-    container_name: netdiag-satellite-${sat.id}
+    container_name: netdiag-satellite-${sanitizeBranchId(sat.id)}
     command: ["satellite"]
     network_mode: host
     cap_add:

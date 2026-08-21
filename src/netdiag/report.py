@@ -10,6 +10,7 @@ from typing import Any
 from jinja2 import Template
 
 from .config import Config, data_dir
+from .labels import format_kind, kind_label
 from .timeutil import display_ts
 
 
@@ -17,21 +18,34 @@ AGG_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>netdiag — {{ site_name }}</title>
 <style>
-  body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 2rem; max-width: 1000px; color: #122; background: #f7f8fa; }
-  h1 { font-size: 1.6rem; margin-bottom: 0.2rem; }
-  .meta { color: #456; margin-bottom: 1.5rem; }
-  .card { background: #fff; border: 1px solid #dde; border-radius: 8px; padding: 1rem 1.2rem; margin-bottom: 1rem; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 1.25rem; max-width: 1000px; color: #122; background: #f7f8fa; }
+  h1 { font-size: 1.45rem; margin-bottom: 0.2rem; }
+  .meta { color: #456; margin-bottom: 1.25rem; font-size: 0.92rem; }
+  .card { background: #fff; border: 1px solid #dde; border-radius: 8px; padding: 1rem 1.1rem; margin-bottom: 1rem; }
+  .scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.88rem; min-width: 28rem; }
   th, td { text-align: left; padding: 0.35rem 0.45rem; border-bottom: 1px solid #eee; }
   th { color: #456; font-weight: 600; }
   .kind { font-weight: 700; }
-  .warn { color: #a30; }
+  .warn { color: #a30; font-weight: 600; }
   .muted { color: #789; }
   a { color: #06c; }
-  pre { white-space: pre-wrap; font-size: 0.85rem; }
-  .topo-embed svg { display: block; margin-top: 0.5rem; }
+  pre { white-space: pre-wrap; font-size: 0.82rem; }
+  .cell-ok { background: #e6f5ea; color: #1a6b35; font-weight: 600; }
+  .cell-loss { background: #fde8e8; color: #a11; font-weight: 600; }
+  .cell-unknown, .cell-mixed, .cell-empty { background: #eef0f3; color: #556; }
+  .topo-embed svg { display: block; margin-top: 0.5rem; max-width: 100%; height: auto; }
+  .headline { font-size: 1.02rem; margin: 0 0 0.5rem; }
+  details.raw { margin-top: 0.5rem; }
+  details.raw summary { cursor: pointer; color: #456; font-size: 0.9rem; }
+  @media (max-width: 640px) {
+    body { margin: 0.75rem; }
+    table { font-size: 0.8rem; min-width: 22rem; }
+    .hide-sm { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -42,14 +56,16 @@ AGG_TEMPLATE = """<!DOCTYPE html>
   <div class="card">
     <h2>Summary</h2>
     <p>{{ summary_text }}</p>
+    <div class="scroll">
     <table>
       <tr><th>Class</th><th>Weighted score</th></tr>
-      {% for kind, n in by_kind %}
-      <tr><td class="kind">{{ kind }}</td><td>{{ '%.0f'|format(n) }}</td></tr>
+      {% for kind, n, label in by_kind_rows %}
+      <tr><td class="kind">{{ kind }}{% if label %} — <span class="muted">{{ label }}</span>{% endif %}</td><td>{{ '%.0f'|format(n) }}</td></tr>
       {% else %}
       <tr><td colspan="2">No incidents yet.</td></tr>
       {% endfor %}
     </table>
+    </div>
   </div>
 
   <div class="card">
@@ -59,6 +75,7 @@ AGG_TEMPLATE = """<!DOCTYPE html>
 
   <div class="card">
     <h2>Vantage × group</h2>
+    <div class="scroll">
     <table>
       <tr>
         <th>Vantage</th><th>Link</th><th>State</th>
@@ -70,33 +87,38 @@ AGG_TEMPLATE = """<!DOCTYPE html>
         <td>{{ row.link }}</td>
         <td class="{{ 'warn' if row.state == 'stale' else ('muted' if row.state in ['never_seen','offline'] else '') }}">{{ row.state }}</td>
         {% for gid in group_ids %}
-        <td>{{ row.groups.get(gid, '—') }}</td>
+        {% set st = row.groups.get(gid, '—') %}
+        <td class="{{ 'cell-ok' if st == 'ok' else ('cell-loss' if st == 'loss' else ('cell-unknown' if st in ['unknown','mixed','empty','—'] or st else '')) }}">{{ st }}</td>
         {% endfor %}
       </tr>
       {% endfor %}
     </table>
+    </div>
   </div>
 
   <div class="card">
     <h2>Canary loss</h2>
+    <div class="scroll">
     <table>
-      <tr><th>Host</th><th>Group</th><th>Rounds</th><th>Bad</th><th>Loss %</th><th>RTT avg</th><th>RTT max</th></tr>
+      <tr><th>Host</th><th>Group</th><th>Rounds</th><th>Bad</th><th>Loss %</th><th class="hide-sm">RTT avg</th><th class="hide-sm">RTT max</th></tr>
       {% for row in host_stats %}
       <tr>
         <td>{{ row.host }}</td>
         <td>{{ row.group }}</td>
         <td>{{ row.rounds }}</td>
         <td>{{ row.bad }}</td>
-        <td class="{{ 'warn' if row.loss_pct > 1 else '' }}">{{ '%.2f'|format(row.loss_pct) }}</td>
-        <td>{% if row.rtt_avg is not none %}{{ '%.1f'|format(row.rtt_avg) }}{% else %}—{% endif %}</td>
-        <td>{% if row.rtt_max %}{{ '%.1f'|format(row.rtt_max) }}{% else %}—{% endif %}</td>
+        <td class="{{ 'warn' if row.loss_pct >= loss_threshold_pct else '' }}">{{ '%.2f'|format(row.loss_pct) }}</td>
+        <td class="hide-sm">{% if row.rtt_avg is not none %}{{ '%.1f'|format(row.rtt_avg) }}{% else %}—{% endif %}</td>
+        <td class="hide-sm">{% if row.rtt_max %}{{ '%.1f'|format(row.rtt_max) }}{% else %}—{% endif %}</td>
       </tr>
       {% endfor %}
     </table>
+    </div>
   </div>
 
   <div class="card">
     <h2>Satellites</h2>
+    <div class="scroll">
     <table>
       <tr><th>ID</th><th>Link</th><th>Availability</th><th>Last seen</th><th>State</th></tr>
       {% for s in satellites %}
@@ -111,6 +133,7 @@ AGG_TEMPLATE = """<!DOCTYPE html>
       <tr><td colspan="5">None configured (single-probe mode).</td></tr>
       {% endfor %}
     </table>
+    </div>
   </div>
 
   <div class="card">
@@ -127,12 +150,13 @@ AGG_TEMPLATE = """<!DOCTYPE html>
 
   <div class="card">
     <h2>Incidents</h2>
+    <div class="scroll">
     <table>
       <tr><th>When</th><th>Class</th><th>Duration</th><th>Where / detail</th></tr>
       {% for inc in incidents %}
       <tr>
         <td>{{ inc.start_disp }}</td>
-        <td class="kind">{{ inc.kind }}</td>
+        <td class="kind">{{ inc.kind_display or inc.kind }}</td>
         <td>{{ inc.duration }}</td>
         <td><a href="incidents/{{ inc.file }}">#{{ inc.id }}</a> — {{ inc.where_short or inc.verdict_short }}</td>
       </tr>
@@ -140,11 +164,15 @@ AGG_TEMPLATE = """<!DOCTYPE html>
       <tr><td colspan="4">None yet.</td></tr>
       {% endfor %}
     </table>
+    </div>
   </div>
 
   <div class="card">
     <h2>Probe NIC / health</h2>
-    <pre>{{ iface_text }}</pre>
+    <p class="headline">{{ iface_headline }}</p>
+    <details class="raw"><summary>Technical detail</summary>
+    <pre>{{ iface_detail }}</pre>
+    </details>
   </div>
 </body>
 </html>
@@ -154,21 +182,27 @@ INC_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Incident {{ id }} — {{ kind }}</title>
 <style>
-  body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 2rem; max-width: 900px; color: #122; background: #f7f8fa; }
-  .card { background: #fff; border: 1px solid #dde; border-radius: 8px; padding: 1rem 1.2rem; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 1.25rem; max-width: 900px; color: #122; background: #f7f8fa; }
+  .card { background: #fff; border: 1px solid #dde; border-radius: 8px; padding: 1rem 1.1rem; }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.88rem; min-width: 24rem; }
   th, td { text-align: left; padding: 0.35rem 0.45rem; border-bottom: 1px solid #eee; }
   a { color: #06c; }
   pre { white-space: pre-wrap; }
-  .topo-embed svg { display: block; margin-top: 0.5rem; }
+  .muted { color: #567; }
+  .cell-ok { background: #e6f5ea; color: #1a6b35; font-weight: 600; }
+  .cell-loss { background: #fde8e8; color: #a11; font-weight: 600; }
+  .cell-unknown, .cell-mixed, .cell-empty { background: #eef0f3; color: #556; }
+  .topo-embed svg { display: block; margin-top: 0.5rem; max-width: 100%; height: auto; }
 </style>
 </head>
 <body>
   <p><a href="../report.html">&larr; Aggregate report</a> · <a href="../topology.html">Topology</a></p>
   <div class="card">
-    <h1>{{ kind }}</h1>
+    <h1>{{ kind_display or kind }}</h1>
     <p><strong>Start:</strong> {{ start }}<br/>
        <strong>End:</strong> {{ end or 'ongoing' }}<br/>
        <strong>Duration:</strong> {{ duration }}<br/>
@@ -180,17 +214,22 @@ INC_TEMPLATE = """<!DOCTYPE html>
     <h2>Verdict</h2>
     <p>{{ verdict }}</p>
     <h2>Vantage × group</h2>
+    <div class="scroll">
     <table>
       <tr><th>Vantage</th><th>Link</th><th>State</th>{% for gid in group_ids %}<th>{{ gid }}</th>{% endfor %}</tr>
       {% for row in matrix %}
       <tr>
         <td>{{ row.vantage_id }}</td><td>{{ row.link }}</td><td>{{ row.state }}</td>
-        {% for gid in group_ids %}<td>{{ row.groups.get(gid, '—') }}</td>{% endfor %}
+        {% for gid in group_ids %}
+        {% set st = row.groups.get(gid, '—') %}
+        <td class="{{ 'cell-ok' if st == 'ok' else ('cell-loss' if st == 'loss' else ('cell-unknown' if st else '')) }}">{{ st }}</td>
+        {% endfor %}
       </tr>
       {% else %}
       <tr><td colspan="3">n/a</td></tr>
       {% endfor %}
     </table>
+    </div>
     <h2>Affected hosts</h2>
     <pre>{{ hosts_text }}</pre>
     <h2>Vantages</h2>
@@ -287,6 +326,7 @@ def write_incident_html(
     html = Template(INC_TEMPLATE).render(
         id=inc.get("id"),
         kind=inc.get("kind"),
+        kind_display=format_kind(inc.get("kind")),
         start=display_ts(start, cfg.timezone),
         end=display_ts(inc.get("end"), cfg.timezone) if inc.get("end") else None,
         duration=_duration(inc),
@@ -318,6 +358,9 @@ def write_reports(
     matrix: list[dict[str, Any]] | None = None,
     l2_bridges: list[dict[str, Any]] | None = None,
     topology: dict[str, Any] | None = None,
+    iface_headline: str = "",
+    iface_detail: str = "",
+    loss_threshold_pct: int = 50,
 ) -> None:
     root = data_dir()
     reports = root / "reports"
@@ -336,13 +379,17 @@ def write_reports(
             incident=open_inc,
             l2_bridges=l2_bridges,
         )
+    # Prefer plain-language kind on topology embed
+    if topology.get("incident_kind"):
+        topology = dict(topology)
+        topology["incident_kind_display"] = format_kind(topology.get("incident_kind"))
     write_topology_files(topology)
     topo_frag = embed_topology_fragment(topology)
 
     by_kind = by_kind_weighted or []
+    by_kind_rows = [(k, n, kind_label(k)) for k, n in by_kind]
     inc_rows = []
     for inc in incidents:
-        # Per-incident map with that incident's blame frozen
         from .topology import build_topology
 
         meta = dict(inc.get("meta") or {})
@@ -355,6 +402,9 @@ def write_reports(
             shared_upstream_hint=meta.get("shared_upstream_hint"),
             census=meta.get("census") or (topology or {}).get("census"),
         )
+        if inc_topo.get("incident_kind"):
+            inc_topo = dict(inc_topo)
+            inc_topo["incident_kind_display"] = format_kind(inc_topo.get("incident_kind"))
         fname = write_incident_html(
             inc,
             incidents_dir,
@@ -371,6 +421,7 @@ def write_reports(
                 "start": inc.get("start"),
                 "start_disp": display_ts(inc.get("start"), cfg.timezone),
                 "kind": inc.get("kind"),
+                "kind_display": format_kind(inc.get("kind")),
                 "duration": _duration(inc),
                 "file": fname,
                 "verdict_short": (verdict[:120] + "…") if len(verdict) > 120 else verdict,
@@ -382,6 +433,10 @@ def write_reports(
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), cfg.timezone
     )
     group_ids = [g.id for g in cfg.groups]
+    if not iface_headline and iface_text:
+        parts = iface_text.split("\n\n", 1)
+        iface_headline = parts[0]
+        iface_detail = parts[1] if len(parts) > 1 else iface_text
     html = Template(AGG_TEMPLATE).render(
         site_name=cfg.site_name,
         generated=generated,
@@ -389,15 +444,17 @@ def write_reports(
         vantage_id=cfg.vantage.id,
         vantage_link=cfg.vantage.link,
         summary_text=summary_text,
-        by_kind=by_kind,
+        by_kind_rows=by_kind_rows,
         host_stats=host_stats,
         satellites=satellites,
         incidents=inc_rows,
-        iface_text=iface_text,
+        iface_headline=iface_headline or "Probe NIC status",
+        iface_detail=iface_detail or iface_text,
         matrix=matrix or [],
         group_ids=group_ids,
         l2_bridges=l2_bridges or [],
         topology_html=topo_frag,
+        loss_threshold_pct=loss_threshold_pct,
     )
     _atomic_write(reports / "report.html", html)
     payload = {

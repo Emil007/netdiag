@@ -349,12 +349,17 @@ def _esc(s: str) -> str:
 
 
 def write_topology_files(topo: dict[str, Any], where: str = "", confidence: str = "") -> None:
+    from .labels import format_kind
+
     reports = data_dir() / "reports"
     reports.mkdir(parents=True, exist_ok=True)
     _atomic_write(reports / "topology.json", json.dumps(topo, indent=2))
     svg = topology_svg(topo)
+    kind = topo.get("incident_kind")
+    kind_disp = topo.get("incident_kind_display") or (format_kind(kind) if kind else "")
     html = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>netdiag topology</title>
 <style>
  body {{ font-family: ui-sans-serif, system-ui, sans-serif; margin: 1.5rem; color: #122; background: #f7f8fa; }}
@@ -362,6 +367,7 @@ def write_topology_files(topo: dict[str, Any], where: str = "", confidence: str 
  .where {{ font-size: 1.05rem; margin: 0.8rem 0; }}
  .muted {{ color: #567; font-size: 0.9rem; }}
  a {{ color: #06c; }}
+ svg {{ max-width: 100%; height: auto; }}
 </style></head><body>
 <p><a href="report.html">&larr; Report</a></p>
 <div class="card">
@@ -369,7 +375,7 @@ def write_topology_files(topo: dict[str, Any], where: str = "", confidence: str 
 <p class="muted">{_esc(topo.get("caption", ""))}</p>
 <p class="where"><strong>Where:</strong> {_esc(where or topo.get("where") or "n/a")}<br/>
 <strong>Confidence:</strong> {_esc(confidence or topo.get("confidence") or "n/a")}
-{" · <strong>" + _esc(topo.get("incident_kind")) + "</strong>" if topo.get("incident_kind") else ""}</p>
+{" · <strong>" + _esc(kind_disp) + "</strong>" if kind_disp else ""}</p>
 {svg}
 </div></body></html>
 """
@@ -377,14 +383,17 @@ def write_topology_files(topo: dict[str, Any], where: str = "", confidence: str 
 
 
 def embed_topology_fragment(topo: dict[str, Any]) -> str:
+    from .labels import format_kind
+
     svg = topology_svg(topo)
     where = _esc(topo.get("where") or "n/a")
     conf = _esc(topo.get("confidence") or "n/a")
-    kind = _esc(topo.get("incident_kind") or "")
+    kind = topo.get("incident_kind")
+    kind_disp = _esc(topo.get("incident_kind_display") or (format_kind(kind) if kind else ""))
     return (
         f'<div class="topo-embed">'
         f'<p><strong>Where:</strong> {where}<br/><strong>Confidence:</strong> {conf}'
-        f'{(" · <strong>" + kind + "</strong>") if kind else ""}'
+        f'{(" · <strong>" + kind_disp + "</strong>") if kind_disp else ""}'
         f' · <a href="topology.html">Full map</a></p>'
         f"{svg}"
         f'<p class="muted">{_esc(topo.get("caption", ""))}</p>'

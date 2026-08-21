@@ -42,6 +42,7 @@ STATUS_HTML = """<!DOCTYPE html>
   <h1>netdiag</h1>
   <p class="meta" id="meta">Loading…</p>
   <div id="banner" class="banner" hidden></div>
+  <div id="waiting" class="banner" hidden></div>
   <div class="card" id="incident">
     <div class="muted">Open incident</div>
     <div id="incBody">…</div>
@@ -73,17 +74,26 @@ async function tick() {
       ban.hidden = false;
       ban.textContent = 'Ingest locked: set a real NETDIAG_INGEST_TOKEN (not change-me). Status UI still works.';
     } else { ban.hidden = true; }
+    const wait = document.getElementById('waiting');
+    if (d.ready === false) {
+      wait.hidden = false;
+      wait.textContent = d.waiting_message || d.generated || 'Waiting for first data…';
+    } else { wait.hidden = true; }
     const inc = d.open_incident;
     const body = document.getElementById('incBody');
-    if (inc && inc.kind) {
-      body.innerHTML = '<div class="kind warn">' + esc(inc.kind) + '</div>' +
+    if (d.ready === false) {
+      body.innerHTML = '<div class="muted">Waiting for first data…</div>';
+    } else if (inc && inc.kind) {
+      const title = esc(inc.kind_display || (inc.kind + (inc.kind_label ? ' — ' + inc.kind_label : '')));
+      body.innerHTML = '<div class="kind warn">' + title + '</div>' +
         '<div>Confidence: ' + esc(inc.confidence || 'n/a') + '</div>' +
         '<div>Where: ' + esc(inc.where_text || 'n/a') + '</div>' +
         (inc.href ? '<div><a href="' + esc(inc.href) + '">Incident page</a></div>' : '');
     } else {
       body.innerHTML = '<div class="ok">None open</div>';
     }
-    document.getElementById('census').textContent = d.census_text || 'census: n/a';
+    document.getElementById('census').textContent =
+      d.ready === false ? 'Waiting for first data…' : (d.census_text || 'no speakers yet');
     const ul = document.getElementById('sats');
     ul.innerHTML = '';
     const sats = d.satellites || [];
@@ -119,15 +129,17 @@ class StatusHub:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._snap: dict[str, Any] = {
+            "ready": False,
             "site": "",
-            "generated": "",
+            "generated": "Waiting for first data…",
             "vantage_id": "",
             "vantage_link": "",
             "open_incident": None,
-            "census_text": "census: n/a",
+            "census_text": "Waiting for first data…",
             "satellites": [],
             "health_notes": [],
             "ingest_locked": False,
+            "waiting_message": "Warming up — first measurements soon.",
         }
 
     def update(self, snap: dict[str, Any]) -> None:

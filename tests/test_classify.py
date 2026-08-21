@@ -605,7 +605,7 @@ def test_census_mass_disappear_sharp_collapse():
     snap = c.snapshot(now)
     assert snap["mass_disappear"]
     assert snap["active"] >= 8
-    assert "census:" in snap["text"]
+    assert "speakers" in snap["text"]
 
 
 def test_census_overnight_quiet_not_mass():
@@ -684,6 +684,66 @@ def test_shared_upstream_hint():
     )
     hint = infer_shared_upstream(cfg, {"192.168.1.10", "192.168.1.20"})
     assert hint and "shared upstream" in hint.lower()
+
+
+def test_sat_incomplete_ping_not_confirmed_branch():
+    """Sat that only pinged gateway+external must not confirm BRANCH as multi-vantage."""
+    cfg = _cfg(
+        satellites=[SatelliteExpect("sat-wired-1", "ethernet", "always", placement="router")]
+    )
+    lost = {"192.168.1.10"}
+    local = _ping(
+        {
+            "192.168.1.1": 0,
+            "192.168.1.2": 0,
+            "192.168.1.12": 0,
+            "192.168.1.10": 100,
+            "1.1.1.1": 0,
+        }
+    )
+    # Satellite payload only has gateway + external — branch host absent
+    sat_ping = {
+        "192.168.1.1": {"sent": 3, "recv": 3, "loss": 0},
+        "1.1.1.1": {"sent": 3, "recv": 3, "loss": 0},
+    }
+    now = time.time()
+    rows = [
+        {
+            "vantage_id": "sat-wired-1",
+            "link": "ethernet",
+            "availability": "always",
+            "placement": "router",
+            "received_at": _iso(now),
+            "last_event": "sample",
+            "payload": {"ping": sat_ping},
+        }
+    ]
+    states = resolve_satellite_states(cfg, rows, now)
+    from netdiag.classify import group_reachability
+
+    gstat = group_reachability(cfg, sat_ping)
+    assert gstat.get("living_room") == "unknown"
+    r = classify_loss(cfg, lost, local_ping=local, sat_states=states)
+    assert r and r.kind == "SINGLE_HOST"
+    assert r.confidence == "single_vantage"
+
+
+def test_group_reachability_absent_is_unknown():
+    from netdiag.classify import group_reachability
+
+    cfg = _cfg()
+    ping = {"192.168.1.1": {"sent": 3, "recv": 3, "loss": 0}}
+    g = group_reachability(cfg, ping)
+    assert g["router"] == "ok"
+    assert g["living_room"] == "unknown"
+    assert g["same"] == "unknown"
+
+
+def test_kind_labels():
+    from netdiag.labels import format_kind
+
+    assert "Room/spur" in format_kind("BRANCH")
+    assert "PROBE_ISOLATED" in format_kind("PROBE_ISOLATED")
 
 
 def test_status_http_ui_and_ingest_auth(tmp_path: Path):

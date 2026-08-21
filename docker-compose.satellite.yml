@@ -7,6 +7,11 @@
 #
 # Same image as coordinator. List this vantage.id under satellites: on the
 # coordinator NETDIAG_CONFIG_YAML (or it stays STATUS-only as unexpected).
+#
+# IMPORTANT: groups: must mirror the coordinator’s canaries (same hosts).
+# Missing ping keys are treated as unknown — not down — but triangulation
+# only confirms BRANCH/SINGLE_HOST when this satellite actually pinged that group.
+# Coordinator status UI: http://<coordinator-LAN-IP>:8787/
 # =============================================================================
 
 services:
@@ -37,7 +42,7 @@ services:
           id: sat-wired-1           # must match coordinator satellites[].id
           link: ethernet            # ethernet | wifi
           availability: always      # wifi hosts: intermittent (may sleep)
-          note: "optional wired vantage"
+          note: "optional wired vantage — ping same canaries as coordinator"
           # placement is declared on the *coordinator* satellites: list
           # (placement: router | other). Match that intent there.
 
@@ -49,13 +54,32 @@ services:
           url: "http://192.168.1.10:8787/ingest"
           token: "change-me"        # overridden by NETDIAG_COORDINATOR_TOKEN
 
+        # Mirror coordinator groups (edit to match your coordinator compose)
         groups:
           - id: router
             role: gateway
             hosts: ["192.168.1.1"]
+
           - id: mesh_a
             role: mesh
             hosts: ["192.168.1.2"]
+
+          - id: mesh_b
+            role: mesh
+            hosts: ["192.168.1.3"]
+
+          - id: living_room
+            role: branch
+            hosts: ["192.168.1.10", "192.168.1.11"]
+
+          - id: same_switch_as_probe
+            role: same_segment
+            hosts: ["192.168.1.12"]
+
+          - id: wifi_sample
+            role: wifi
+            hosts: ["192.168.1.50"]
+
           - id: internet
             role: external
             hosts: ["1.1.1.1", "8.8.8.8"]
