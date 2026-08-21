@@ -1,0 +1,9 @@
+# Copy to boot partition as: netdiag.groups.yaml
+# Mirror the coordinator's groups: hosts exactly (same ids/roles/hosts).
+- id: router
+  role: gateway
+  hosts: ["192.168.1.1"]
+
+- id: internet
+  role: external
+  hosts: ["1.1.1.1", "8.8.8.8"]

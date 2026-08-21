@@ -5,7 +5,7 @@
 # Setup: edit THIS file only, then:
 #   docker compose up -d
 #
-# Pulls ghcr.io/emil007/netdiag:latest (built on GitHub; linux/amd64 + arm64).
+# Pulls ghcr.io/emil007/netdiag:latest (amd64 + arm64 + arm/v7).
 # Do not build: on the Docker host unless you are developing.
 #
 # Requires Linux Docker Engine + host networking (not Docker Desktop).

@@ -2,7 +2,7 @@
 
 Home-LAN diagnostics as a **Docker Compose** stack. Run for a few days on a Linux host with Docker Engine, then open the HTML report (and topology map).
 
-Image (multi-arch amd64/arm64): `ghcr.io/emil007/netdiag:latest` — built on GitHub Actions. Pull it; do not `build:` on the Docker host unless you are developing.
+Image (multi-arch amd64 / arm64 / **arm/v7**): `ghcr.io/emil007/netdiag:latest` — built on GitHub Actions. Pull it; do not `build:` on the Docker host unless you are developing. Arm/v7 covers Raspberry Pi 2 and other 32-bit Pis.
 
 ## Compose builder (GitHub Pages)
 
@@ -43,6 +43,10 @@ docker compose -f docker-compose.satellite.yml up -d
 ```
 
 List the satellite under `satellites:` in the coordinator compose `NETDIAG_CONFIG_YAML` (default list is empty).
+
+### Bare Raspberry Pi (headless)
+
+Flash **Raspberry Pi OS Lite (32-bit)** for Pi 2, or 64-bit for Pi 3+, then use the boot-partition + first-boot flow in [`scripts/pi-satellite/README.md`](scripts/pi-satellite/README.md). Pi 2 has no onboard Wi‑Fi — a USB adapter is required for a Wi‑Fi satellite.
 
 ## Docs
 

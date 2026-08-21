@@ -1,0 +1,51 @@
+#cloud-config
+# OPTIONAL full first-boot installer. Only use this if you did NOT rely on
+# Raspberry Pi Imager's OS customisation for SSH/Wi-Fi — Imager also writes
+# user-data; copying this file over it replaces those settings.
+#
+# Prefer the default flow: Imager for SSH/Wi-Fi + netdiag.env on bootfs +
+# prepare-boot.ps1 -WaitAndBootstrap (or one SSH curl|bash).
+#
+# If you do use this file, name it exactly user-data on bootfs, and set a
+# password hash / SSH key below before first boot.
+#
+# Pi 2 = Lite 32-bit. Pi 2 needs a USB Wi-Fi dongle for wifi mode.
+
+hostname: netdiag-sat
+manage_etc_hosts: true
+package_update: true
+packages:
+  - curl
+  - ca-certificates
+
+# Uncomment and set — otherwise enable SSH via Imager instead of this file.
+# users:
+#   - name: pi
+#     groups: [sudo]
+#     shell: /bin/bash
+#     sudo: ALL=(ALL) NOPASSWD:ALL
+#     lock_passwd: false
+#     plain_text_passwd: "change-me"
+# ssh_pwauth: true
+
+write_files:
+  - path: /usr/local/sbin/netdiag-firstboot.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      FLAG=/var/lib/netdiag-firstboot.done
+      [[ -f "$FLAG" ]] && exit 0
+      mkdir -p /var/lib
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        if curl -fsSL --connect-timeout 5 https://raw.githubusercontent.com/Emil007/netdiag/main/scripts/pi-satellite/bootstrap.sh -o /tmp/netdiag-bootstrap.sh; then
+          break
+        fi
+        sleep 15
+      done
+      [[ -f /tmp/netdiag-bootstrap.sh ]] || exit 1
+      bash /tmp/netdiag-bootstrap.sh
+      touch "$FLAG"
+
+runcmd:
+  - [ bash, /usr/local/sbin/netdiag-firstboot.sh ]

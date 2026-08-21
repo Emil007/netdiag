@@ -66,6 +66,9 @@ jobs:
         with:
           context: .
           push: true
-          platforms: linux/amd64,linux/arm64
+          # amd64 + arm64 (Pi 3/4/5) + arm/v7 (Pi 2 / older 32-bit)
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          # QEMU arm/v7 is slow; avoid cache misses timing out the job
+          provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
