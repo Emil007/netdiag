@@ -31,11 +31,13 @@ AGG_TEMPLATE = """<!DOCTYPE html>
   .muted { color: #789; }
   a { color: #06c; }
   pre { white-space: pre-wrap; font-size: 0.85rem; }
+  .topo-embed svg { display: block; margin-top: 0.5rem; }
 </style>
 </head>
 <body>
   <h1>netdiag report — {{ site_name }}</h1>
-  <p class="meta">Generated {{ generated }} · Running since {{ started }} · Vantage <strong>{{ vantage_id }}</strong> ({{ vantage_link }})</p>
+  <p class="meta">Generated {{ generated }} · Running since {{ started }} · Vantage <strong>{{ vantage_id }}</strong> ({{ vantage_link }})
+     · <a href="topology.html">Topology map</a></p>
 
   <div class="card">
     <h2>Summary</h2>
@@ -48,6 +50,11 @@ AGG_TEMPLATE = """<!DOCTYPE html>
       <tr><td colspan="2">No incidents yet.</td></tr>
       {% endfor %}
     </table>
+  </div>
+
+  <div class="card">
+    <h2>Topology (fault path)</h2>
+    {{ topology_html | safe }}
   </div>
 
   <div class="card">
@@ -155,10 +162,11 @@ INC_TEMPLATE = """<!DOCTYPE html>
   th, td { text-align: left; padding: 0.35rem 0.45rem; border-bottom: 1px solid #eee; }
   a { color: #06c; }
   pre { white-space: pre-wrap; }
+  .topo-embed svg { display: block; margin-top: 0.5rem; }
 </style>
 </head>
 <body>
-  <p><a href="../report.html">&larr; Aggregate report</a></p>
+  <p><a href="../report.html">&larr; Aggregate report</a> · <a href="../topology.html">Topology</a></p>
   <div class="card">
     <h1>{{ kind }}</h1>
     <p><strong>Start:</strong> {{ start }}<br/>
@@ -167,6 +175,8 @@ INC_TEMPLATE = """<!DOCTYPE html>
        <strong>Confidence:</strong> {{ confidence }}</p>
     <h2>Where</h2>
     <p>{{ where_text or 'n/a' }}</p>
+    <h2>Fault path on map</h2>
+    {{ topology_html | safe }}
     <h2>Verdict</h2>
     <p>{{ verdict }}</p>
     <h2>Vantage × group</h2>
@@ -234,7 +244,12 @@ def _atomic_write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def write_incident_html(inc: dict[str, Any], out_dir: Path, cfg: Config) -> str:
+def write_incident_html(
+    inc: dict[str, Any],
+    out_dir: Path,
+    cfg: Config,
+    topology_html: str = "",
+) -> str:
     out_dir.mkdir(parents=True, exist_ok=True)
     start = inc.get("start") or ""
     safe = re.sub(r"[^0-9A-Za-z_-]+", "", start.replace(":", "").replace("T", "-"))
@@ -246,6 +261,29 @@ def write_incident_html(inc: dict[str, Any], out_dir: Path, cfg: Config) -> str:
     meta = dict(inc.get("meta") or {})
     matrix = meta.get("matrix") or []
     group_ids = [g.id for g in cfg.groups]
+    if not topology_html:
+        from .topology import build_topology, embed_topology_fragment
+
+        topo = build_topology(
+            cfg,
+            matrix=matrix,
+            incident={
+                "kind": inc.get("kind"),
+                "where_text": inc.get("where_text") or "",
+                "hosts": hosts,
+                "meta": meta,
+                "confidence": meta.get("confidence"),
+                "verdict": inc.get("verdict"),
+            },
+            l2_bridges=meta.get("l2_bridges") or [],
+            link_fault=bool(meta.get("link_fault")),
+            shared_upstream_hint=meta.get("shared_upstream_hint"),
+            census=meta.get("census"),
+        )
+        # Fix relative link for incident pages
+        topology_html = embed_topology_fragment(topo).replace(
+            'href="topology.html"', 'href="../topology.html"'
+        )
     html = Template(INC_TEMPLATE).render(
         id=inc.get("id"),
         kind=inc.get("kind"),
@@ -261,6 +299,7 @@ def write_incident_html(inc: dict[str, Any], out_dir: Path, cfg: Config) -> str:
         meta_text=json.dumps(meta, indent=2, default=str),
         matrix=matrix,
         group_ids=group_ids,
+        topology_html=topology_html,
     )
     _atomic_write(out_dir / fname, html)
     return fname
@@ -278,16 +317,52 @@ def write_reports(
     by_kind_weighted: list[tuple[str, float]] | None = None,
     matrix: list[dict[str, Any]] | None = None,
     l2_bridges: list[dict[str, Any]] | None = None,
+    topology: dict[str, Any] | None = None,
 ) -> None:
     root = data_dir()
     reports = root / "reports"
     incidents_dir = reports / "incidents"
     reports.mkdir(parents=True, exist_ok=True)
 
+    from .topology import embed_topology_fragment, write_topology_files
+
+    if topology is None:
+        from .topology import build_topology
+
+        open_inc = next((i for i in incidents if not i.get("end")), None)
+        topology = build_topology(
+            cfg,
+            matrix=matrix,
+            incident=open_inc,
+            l2_bridges=l2_bridges,
+        )
+    write_topology_files(topology)
+    topo_frag = embed_topology_fragment(topology)
+
     by_kind = by_kind_weighted or []
     inc_rows = []
     for inc in incidents:
-        fname = write_incident_html(inc, incidents_dir, cfg)
+        # Per-incident map with that incident's blame frozen
+        from .topology import build_topology
+
+        meta = dict(inc.get("meta") or {})
+        inc_topo = build_topology(
+            cfg,
+            matrix=meta.get("matrix") or matrix or [],
+            incident=inc,
+            l2_bridges=meta.get("l2_bridges") or l2_bridges or [],
+            link_fault=bool(meta.get("link_fault")),
+            shared_upstream_hint=meta.get("shared_upstream_hint"),
+            census=meta.get("census") or (topology or {}).get("census"),
+        )
+        fname = write_incident_html(
+            inc,
+            incidents_dir,
+            cfg,
+            topology_html=embed_topology_fragment(inc_topo).replace(
+                'href="topology.html"', 'href="../topology.html"'
+            ),
+        )
         verdict = inc.get("verdict") or ""
         where = inc.get("where_text") or ""
         inc_rows.append(
@@ -322,6 +397,7 @@ def write_reports(
         matrix=matrix or [],
         group_ids=group_ids,
         l2_bridges=l2_bridges or [],
+        topology_html=topo_frag,
     )
     _atomic_write(reports / "report.html", html)
     payload = {
@@ -336,6 +412,7 @@ def write_reports(
         "incidents": incidents,
         "matrix": matrix,
         "l2_bridges": l2_bridges or [],
+        "topology": topology,
     }
     _atomic_write(reports / "report.json", json.dumps(payload, indent=2, default=str))
 

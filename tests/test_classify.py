@@ -427,3 +427,205 @@ def test_both_lose_gateway_not_local_switch():
     states = resolve_satellite_states(cfg, rows, now)
     r = classify_loss(cfg, lost, local_ping=local, sat_states=states, same_segment_down=True)
     assert r and r.kind == "TOTAL_OUTAGE"
+
+
+def test_config_yaml_env_primary(monkeypatch):
+    yaml_text = """
+site:
+  name: Env Site
+vantage:
+  id: coord-env
+  link: ethernet
+groups:
+  - id: router
+    role: gateway
+    hosts: ["10.0.0.1"]
+  - id: internet
+    role: external
+    hosts: ["1.1.1.1"]
+ingest:
+  token: secret-token
+"""
+    monkeypatch.setenv("NETDIAG_CONFIG_YAML", yaml_text)
+    monkeypatch.setenv("IFACE", "enp3s0")
+    monkeypatch.setenv("NETDIAG_INGEST_TOKEN", "from-env")
+    from netdiag.config import load_config
+
+    cfg = load_config()
+    assert cfg.site_name == "Env Site"
+    assert cfg.vantage.id == "coord-env"
+    assert cfg.iface == "enp3s0"
+    assert cfg.ingest_token == "from-env"
+    assert "10.0.0.1" in cfg.hosts()
+
+
+def test_topology_has_gateway_and_coordinator():
+    from netdiag.topology import build_topology
+
+    topo = build_topology(_cfg())
+    ids = {n["id"] for n in topo["nodes"]}
+    assert "gateway" in ids
+    assert "coordinator" in ids
+    assert "internet" in ids
+    assert "local_switch" in ids  # same_segment present in _cfg
+
+
+def test_topology_no_local_switch_without_same_segment():
+    from netdiag.topology import build_topology
+
+    cfg = _cfg(
+        groups=[
+            Group("router", "gateway", ["192.168.1.1"]),
+            Group("living_room", "branch", ["192.168.1.10"]),
+            Group("net", "external", ["1.1.1.1"]),
+        ]
+    )
+    topo = build_topology(cfg)
+    ids = {n["id"] for n in topo["nodes"]}
+    assert "local_switch" not in ids
+    # branch attaches to gateway
+    assert any(e["from"] == "gateway" and e["to"] == "group:living_room" for e in topo["edges"])
+
+
+def test_topology_behind_switch_flag():
+    from netdiag.topology import build_topology
+
+    cfg = _cfg(
+        vantage=Vantage("coordinator", "ethernet", availability="always", behind_switch=True),
+        groups=[
+            Group("router", "gateway", ["192.168.1.1"]),
+            Group("net", "external", ["1.1.1.1"]),
+        ],
+    )
+    topo = build_topology(cfg)
+    assert any(n["id"] == "local_switch" for n in topo["nodes"])
+
+
+def test_topology_uplink_down_fault_edge():
+    from netdiag.topology import build_topology
+
+    cfg = _cfg()
+    matrix = [
+        {
+            "vantage_id": "coordinator",
+            "link": "ethernet",
+            "state": "online",
+            "groups": {
+                "router": "loss",
+                "same": "ok",
+                "living_room": "loss",
+                "mesh_a": "loss",
+                "net": "loss",
+            },
+        }
+    ]
+    topo = build_topology(
+        cfg,
+        matrix=matrix,
+        incident={
+            "kind": "UPLINK_DOWN",
+            "where_text": "Uplink toward router from local switch",
+            "hosts": {"192.168.1.1": 1},
+            "confidence": "single_vantage",
+        },
+    )
+    assert topo["confidence"] == "single_vantage"
+    fault_edges = [e for e in topo["edges"] if e.get("fault")]
+    assert fault_edges
+    assert any(
+        e.get("label") == "uplink" or (e["from"] == "gateway" and e["to"] == "local_switch")
+        for e in fault_edges
+    )
+
+
+def test_live_map_confidence_from_classifier_not_sat_list():
+    from netdiag.topology import build_topology
+
+    cfg = _cfg(
+        satellites=[SatelliteExpect("sat-wired-1", "ethernet", "always", placement="router")]
+    )
+    topo = build_topology(
+        cfg,
+        incident={
+            "kind": "UPLINK_DOWN",
+            "where_text": "uplink",
+            "confidence": "single_vantage",
+            "meta": {"confidence": "single_vantage"},
+        },
+    )
+    assert topo["confidence"] == "single_vantage"
+
+
+def test_link_fault_clears_after_quiet(monkeypatch):
+    """After CRC then quiet past incident_clear_s, sticky clears; map fault only via open_inc."""
+    from netdiag.engine import Analyzer
+
+    cfg = _cfg(incident_clear_s=1)
+    a = object.__new__(Analyzer)
+    a.cfg = cfg
+    a.open_inc = None
+    a.link_fault_last_at = time.time() - 5
+    a.link_fault_note = "old"
+    assert a._link_fault_sticky() is False
+    a.link_fault_last_at = time.time()
+    assert a._link_fault_sticky() is True
+    assert a._map_link_fault() is False  # no open incident
+    a.open_inc = {"link_fault": True}
+    assert a._map_link_fault() is True
+    a.open_inc = {"link_fault": False}
+    assert a._map_link_fault() is False
+
+
+def test_census_mass_disappear():
+    from netdiag.detectors.census import LanCensus
+
+    c = LanCensus(baseline_s=3600, recent_s=120)
+    now = time.time()
+    for i in range(20):
+        c.speakers[f"192.168.1.{i}"] = now - 600
+    # only 2 still recent
+    c.speakers["192.168.1.1"] = now
+    c.speakers["192.168.1.2"] = now
+    snap = c.snapshot(now)
+    assert snap["mass_disappear"]
+    assert "census:" in snap["text"]
+
+
+def test_stp_verbose_alpine_line():
+    # Typical Alpine tcpdump -v STP line shape
+    line = (
+        "12:00:00.000000 00:11:22:33:44:55 > 01:80:c2:00:00:00, "
+        "802.1d config BPDU: STP flags [none], root-id 8000.00:aa:bb:cc:dd:ee.8001, "
+        "bridge-id 8000.00:11:22:33:44:55.8002, port-id 8002, "
+        "message-age 0.00s, max-age 20.00s, hello-time 2.00s, forward-delay 15.00s"
+    )
+    # Fallback path uses root/bridge regexes when combined _STP misses
+    parsed = parse_l2_line(line)
+    assert parsed is not None
+    assert parsed["kind"] == "stp"
+    assert "11:22:33:44:55" in parsed["id"] or parsed["id"] != "unknown"
+
+
+def test_lldp_line():
+    line = (
+        "12:00:01.000000 aa:bb:cc:dd:ee:ff > 01:80:c2:00:00:0e, ethertype LLDP (0x88cc), "
+        "length 100: LLDP, length 86 Chassis ID TLV"
+    )
+    parsed = parse_l2_line(line)
+    assert parsed is not None
+    assert parsed["kind"] == "lldp"
+
+
+def test_shared_upstream_hint():
+    from netdiag.topology import infer_shared_upstream
+
+    cfg = _cfg(
+        groups=[
+            Group("router", "gateway", ["192.168.1.1"]),
+            Group("a", "branch", ["192.168.1.10"]),
+            Group("b", "branch", ["192.168.1.20"]),
+            Group("net", "external", ["1.1.1.1"]),
+        ]
+    )
+    hint = infer_shared_upstream(cfg, {"192.168.1.10", "192.168.1.20"})
+    assert hint and "shared upstream" in hint.lower()

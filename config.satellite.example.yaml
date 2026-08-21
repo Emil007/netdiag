@@ -1,41 +1,29 @@
-# =============================================================================
-# netdiag satellite config — copy to config.satellite.yaml and edit.
-# =============================================================================
-
+# Docs-only mirror of docker-compose.satellite.yml NETDIAG_CONFIG_YAML.
+# Prefer editing the compose file; no separate mount is required.
 site:
   name: "Home LAN"
   timezone: Europe/Berlin
 
 vantage:
-  # Must match an entry under satellites: on the coordinator (when you add one).
   id: sat-wired-1
-  # ethernet | wifi
   link: ethernet
-  # always = treat long silence as suspicious after offline_after_s
-  # intermittent = default for wifi; sleeping host → offline, not WIFI_PATH
   availability: always
   note: "optional wired vantage"
 
 capture:
-  # Overridden by compose IFACE. ip -br link on THIS host.
   iface: eth0
 
 coordinator:
-  # LAN IP of the coordinator host (not a public hostname unless you intend that).
   url: "http://192.168.1.10:8787/ingest"
-  # Must match coordinator ingest.token
   token: "change-me"
 
-# Same canaries as the coordinator (or a subset). Always-on devices only.
 groups:
   - id: router
     role: gateway
     hosts: ["192.168.1.1"]
-
   - id: mesh_a
     role: mesh
     hosts: ["192.168.1.2"]
-
   - id: internet
     role: external
     hosts: ["1.1.1.1", "8.8.8.8"]

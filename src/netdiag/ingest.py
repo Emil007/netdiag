@@ -23,7 +23,7 @@ def start_ingest(cfg: "Config", store: "Store") -> ThreadingHTTPServer | None:
         if not cfg.allow_insecure_ingest:
             print(
                 "ERROR: ingest token empty or placeholder 'change-me'. "
-                "Set ingest.token in config.yaml (and matching satellite token). "
+                "Set ingest.token in NETDIAG_CONFIG_YAML (and matching satellite token). "
                 "Or set NETDIAG_ALLOW_INSECURE_INGEST=1 for a lab only.",
                 flush=True,
             )

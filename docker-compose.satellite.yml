@@ -1,22 +1,12 @@
 # =============================================================================
-# netdiag — satellite (optional second vantage)
+# netdiag — satellite (optional)
 # =============================================================================
 #
-# Same published image as the coordinator. Lightweight: ping + NIC stats, no pcap.
-# Pushes samples to the coordinator ingest URL.
+# Edit THIS file only, then:
+#   docker compose -f docker-compose.satellite.yml up -d
 #
-# Typical uses on a home LAN:
-#   - Wired host plugged into the router (availability: always) — confirms
-#     "local switch vs uplink vs router".
-#   - Wi-Fi host (availability: intermittent) — helps WIFI_PATH; may sleep.
-#
-# Setup:
-#   1. Copy config.satellite.example.yaml → config.satellite.yaml and edit.
-#   2. Edit IFACE / token overrides below if needed.
-#   3. docker compose -f docker-compose.satellite.yml up -d
-#
-# Coordinator must list this satellite id under satellites: in its config.yaml
-# (or it will be stored but not used for triangulation until listed).
+# Same image as coordinator. List this vantage.id under satellites: on the
+# coordinator NETDIAG_CONFIG_YAML (or it stays STATUS-only as unexpected).
 # =============================================================================
 
 services:
@@ -30,19 +20,55 @@ services:
       - NET_ADMIN
     environment:
       TZ: Europe/Berlin
-
-      # NIC on THIS satellite host (ip -br link). Use the Wi-Fi NIC if link is wifi.
+      # NIC on THIS host (ip -br link). Use wlan0 if link is wifi.
       IFACE: eth0
 
-      # Must match coordinator ingest.token. Not "change-me" in real use.
+      # Must match coordinator NETDIAG_INGEST_TOKEN / ingest.token
       NETDIAG_COORDINATOR_TOKEN: change-me
 
-      # Optional override if you prefer env over config.satellite.yaml:
-      # NETDIAG_COORDINATOR_URL: http://<coordinator-ip>:8787/ingest
-
       NETDIAG_DATA: /data
-      NETDIAG_CONFIG: /app/config.yaml
+
+      NETDIAG_CONFIG_YAML: |
+        site:
+          name: "Home LAN"
+          timezone: Europe/Berlin
+
+        vantage:
+          id: sat-wired-1           # must match coordinator satellites[].id
+          link: ethernet            # ethernet | wifi
+          availability: always      # wifi hosts: intermittent (may sleep)
+          note: "optional wired vantage"
+          # placement is declared on the *coordinator* satellites: list
+          # (placement: router | other). Match that intent there.
+
+        capture:
+          iface: eth0
+
+        coordinator:
+          # LAN IP of the coordinator host
+          url: "http://192.168.1.10:8787/ingest"
+          token: "change-me"        # overridden by NETDIAG_COORDINATOR_TOKEN
+
+        groups:
+          - id: router
+            role: gateway
+            hosts: ["192.168.1.1"]
+          - id: mesh_a
+            role: mesh
+            hosts: ["192.168.1.2"]
+          - id: internet
+            role: external
+            hosts: ["1.1.1.1", "8.8.8.8"]
+
+        dns:
+          resolvers: ["192.168.1.1"]
+          names: ["example.com", "cloudflare.com"]
+
+        thresholds:
+          ping_interval_s: 5
+          dns_interval_s: 30
+          dns_timeout_ms: 1500
+
     volumes:
       - ./data:/data
-      - ./config.satellite.yaml:/app/config.yaml:ro
     restart: unless-stopped

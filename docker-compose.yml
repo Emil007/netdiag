@@ -2,67 +2,147 @@
 # netdiag — coordinator (home LAN diagnostics)
 # =============================================================================
 #
-# What this is:
-#   A Docker Compose stack that runs for days on a Linux host with Docker Engine,
-#   watches a handful of always-on "canary" devices, and writes HTML reports when
-#   something looks broken (bad cable, dying unmanaged switch, rogue DHCP, etc.).
+# Setup: edit THIS file only, then:
+#   docker compose up -d
 #
-# Requirements:
-#   - Linux + Docker Engine with host networking (not Docker Desktop on Windows/Mac)
-#   - Capabilities NET_RAW + NET_ADMIN
+# Pulls ghcr.io/emil007/netdiag:latest (built on GitHub; linux/amd64 + arm64).
+# Do not build: on the Docker host unless you are developing.
 #
-# Setup (no wizard):
-#   1. Copy config.example.yaml → config.yaml and edit the commented groups.
-#   2. Edit the environment values below (IFACE, token, …).
-#   3. docker compose up -d
-#      (pulls ghcr.io/emil007/netdiag:latest — built on GitHub; do not build: here
-#       unless you are developing the image yourself)
-#
-# Optional: the same compose file can be pasted into Portainer or any compose UI.
-# Some UIs want an absolute host path for volumes instead of ./data.
-#
-# Image: ghcr.io/emil007/netdiag:latest  (linux/amd64 + linux/arm64)
-# If the pull is unauthorized: docker login ghcr.io  — or make the GHCR package public.
+# Requires Linux Docker Engine + host networking (not Docker Desktop).
+# Optional: paste into Portainer; some UIs want an absolute path for ./data.
+# Ingest will not start until token ≠ change-me (unless NETDIAG_ALLOW_INSECURE_INGEST=1).
 # =============================================================================
 
 services:
   analyzer:
     image: ghcr.io/emil007/netdiag:latest
     container_name: netdiag-analyzer
-    # Host networking is required so fping/tcpdump see the real LAN.
     network_mode: host
     cap_add:
       - NET_RAW
       - NET_ADMIN
     environment:
-      # Timezone for logs/pcap filenames/display (IANA name).
+      # Host timezone (IANA). Also used for pcap filenames / report display.
       TZ: Europe/Berlin
 
-      # NIC on THIS Docker host that faces the home LAN.
-      # Find it with: ip -br link
-      # Examples: eth0, enp3s0, wlan0 — do not guess.
+      # NIC on THIS Docker host facing the LAN. Find with: ip -br link
       IFACE: eth0
 
-      # Ingest token satellites must send. MUST NOT stay "change-me" in real use.
-      # Generate something random. Must match satellite config coordinator.token.
+      # Must match satellites. Replace change-me before real use.
       NETDIAG_INGEST_TOKEN: change-me
 
-      # Optional: bind ingest to a specific address (default comes from config.yaml).
-      # Prefer your LAN IP instead of 0.0.0.0 if the host also has WAN/VPN.
+      # Optional: prefer LAN IP instead of 0.0.0.0 on multi-homed hosts
       # NETDIAG_INGEST_HOST: 192.168.1.10
       # NETDIAG_INGEST_PORT: "8787"
-
-      # Lab only — allows empty/placeholder token (insecure).
       # NETDIAG_ALLOW_INSECURE_INGEST: "1"
 
       NETDIAG_DATA: /data
-      NETDIAG_CONFIG: /app/config.yaml
+
+      # -------------------------------------------------------------------------
+      # Full netdiag config (nested YAML). Edit canaries / satellites / thresholds
+      # here. Short overlays above (IFACE, TZ, token) still win when set.
+      # Do NOT list this host's own IP as a canary. Canaries must answer ping.
+      # -------------------------------------------------------------------------
+      NETDIAG_CONFIG_YAML: |
+        site:
+          name: "Home LAN"
+          timezone: Europe/Berlin
+
+        vantage:
+          id: coordinator
+          link: ethernet          # ethernet | wifi
+          availability: always
+          # behind_switch: true   # set if this probe is behind an unmanaged switch
+          #                       # (or use a same_segment canary — either shows local_switch on the map)
+          note: "main probe on the home LAN"
+
+        capture:
+          iface: eth0             # overridden by IFACE when set
+          snaplen: 256            # keep identical to capture service NETDIAG_SNAPLEN
+          rotate_hours: 1
+          keep_hours: 48          # keep identical to capture service NETDIAG_KEEP_HOURS
+
+        ingest:
+          enabled: true
+          host: "0.0.0.0"
+          port: 8787
+          token: "change-me"      # overridden by NETDIAG_INGEST_TOKEN when set
+
+        # Default none. Uncomment to enable triangulation.
+        satellites: []
+        # satellites:
+        #   - id: sat-wired-1
+        #     link: ethernet
+        #     availability: always
+        #     placement: router     # router | other
+        #     note: "wired vantage nearer the router"
+        #   - id: sat-wifi-1
+        #     link: wifi
+        #     availability: intermittent
+        #     placement: other
+
+        groups:
+          # Primary router / ISP gateway (usually .1)
+          - id: router
+            role: gateway
+            hosts: ["192.168.1.1"]
+
+          # Optional mesh/AP management IPs (must answer ping)
+          - id: mesh_a
+            role: mesh
+            hosts: ["192.168.1.2"]
+
+          - id: mesh_b
+            role: mesh
+            hosts: ["192.168.1.3"]
+
+          # Room/spur behind one unmanaged switch (group id appears in Where)
+          # attach: gateway (default) | local_switch (only if that spur is on the probe's switch)
+          - id: living_room
+            role: branch
+            # attach: gateway
+            hosts: ["192.168.1.10", "192.168.1.11"]
+
+          # Other always-on box on SAME switch as this probe (not this host)
+          # Presence of same_segment also enables the inferred local_switch map node.
+          - id: same_switch_as_probe
+            role: same_segment
+            hosts: ["192.168.1.12"]
+
+          # Optional always-on Wi-Fi canary (prefer AP IPs over phones)
+          - id: wifi_sample
+            role: wifi
+            hosts: ["192.168.1.50"]
+
+          - id: internet
+            role: external
+            hosts: ["1.1.1.1", "8.8.8.8"]
+
+        dhcp:
+          expected_server_mac: ""
+
+        dns:
+          resolvers: ["192.168.1.1"]
+          names: ["example.com", "cloudflare.com", "google.com"]
+
+        thresholds:
+          ping_interval_s: 5
+          incident_clear_s: 60
+          warmup_s: 150
+          loss_threshold_pct: 50
+          fail_rounds: 2
+          confirm_rounds: 2
+          dns_interval_s: 30
+          dns_timeout_ms: 1500
+          path_interval_s: 300
+          bcast_pps_warn: 200
+          satellite_stale_s: 45
+          satellite_offline_after_s: 1200
+          report_interval_s: 60
+
     volumes:
-      # Persistent reports, logs, SQLite, captures.
-      # Portainer tip: use an absolute path, e.g. /srv/netdiag/data:/data
+      # Reports / logs / captures. Portainer: absolute path often works better.
       - ./data:/data
-      # Canaries, satellites, roles — edit config.yaml (copy from config.example.yaml).
-      - ./config.yaml:/app/config.yaml:ro
     restart: unless-stopped
 
   capture:
@@ -75,11 +155,13 @@ services:
       - NET_ADMIN
     environment:
       TZ: Europe/Berlin
-      # Must match analyzer IFACE.
       IFACE: eth0
       NETDIAG_DATA: /data
-      NETDIAG_CONFIG: /app/config.yaml
+      # Keep these identical to analyzer capture.snaplen / keep_hours / rotate_hours
+      # (avoid duplicating the full NETDIAG_CONFIG_YAML block here).
+      NETDIAG_SNAPLEN: "256"
+      NETDIAG_KEEP_HOURS: "48"
+      NETDIAG_ROTATE_HOURS: "1"
     volumes:
       - ./data:/data
-      - ./config.yaml:/app/config.yaml:ro
     restart: unless-stopped

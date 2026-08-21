@@ -27,6 +27,7 @@ class DhcpWatch:
     expected_mac: str = ""
     on_alarm: Callable[[str, str], None] | None = None
     on_learned: Callable[[str], None] | None = None
+    on_client: Callable[[str], None] | None = None
     learned_mac: str = ""
     alarms: list[str] = field(default_factory=list)
     _seen_bad: set[str] = field(default_factory=set)
@@ -51,9 +52,12 @@ class DhcpWatch:
             "-nnel",
             "-l",
             "udp",
-            "src",
             "port",
             "67",
+            "or",
+            "udp",
+            "port",
+            "68",
         ]
         while not self._stop.is_set():
             try:
@@ -83,13 +87,17 @@ class DhcpWatch:
             time.sleep(1)
 
     def _handle_line(self, line: str) -> None:
+        macs = _MAC.findall(line.lower())
+        if _CLIENTISH.search(line) and self.on_client and macs:
+            # Client Discover/Request — census only (not every MAC as a topology node)
+            client = macs[0] if macs[0] != "ff:ff:ff:ff:ff:ff" else (macs[1] if len(macs) > 1 else "")
+            if client:
+                self.on_client(client)
         if _CLIENTISH.search(line) and not _SERVERISH.search(line):
             return
         if not _SERVERISH.search(line) and ".67 >" not in line and "67 >" not in line:
-            # src port 67 filter should already limit; still require reply-ish
             if "Offer" not in line and "ACK" not in line and "ack" not in line:
                 return
-        macs = _MAC.findall(line.lower())
         if not macs:
             return
         # With -e, first MAC is typically source (server on replies from port 67)

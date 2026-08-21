@@ -13,6 +13,8 @@ class Group:
     id: str
     role: str
     hosts: list[str]
+    # gateway (default) | local_switch — where this spur attaches on the map
+    attach: str = "gateway"
 
 
 @dataclass
@@ -21,6 +23,8 @@ class Vantage:
     link: str  # ethernet | wifi
     note: str = ""
     availability: str = "always"  # always | intermittent
+    # True when this probe sits behind an unmanaged switch (or use same_segment)
+    behind_switch: bool = False
 
 
 @dataclass
@@ -129,13 +133,66 @@ def _parse_hosts(hosts: Any) -> list[str]:
     return [str(h) for h in hosts]
 
 
+def _default_raw() -> dict[str, Any]:
+    return {
+        "site": {"name": "Home LAN", "timezone": "Europe/Berlin"},
+        "vantage": {
+            "id": "coordinator",
+            "link": "ethernet",
+            "availability": "always",
+            "note": "main probe",
+        },
+        "capture": {"iface": "eth0", "snaplen": 128, "rotate_hours": 1, "keep_hours": 48},
+        "ingest": {
+            "enabled": True,
+            "host": "0.0.0.0",
+            "port": 8787,
+            "token": "change-me",
+        },
+        "satellites": [],
+        "groups": [
+            {"id": "router", "role": "gateway", "hosts": ["192.168.1.1"]},
+            {"id": "internet", "role": "external", "hosts": ["1.1.1.1", "8.8.8.8"]},
+        ],
+        "dhcp": {"expected_server_mac": ""},
+        "dns": {
+            "resolvers": ["192.168.1.1"],
+            "names": ["example.com", "cloudflare.com"],
+        },
+        "thresholds": {},
+        "coordinator": {},
+    }
+
+
 def load_config(path: str | Path | None = None) -> Config:
-    """Load canaries/satellites from config.yaml; short host overrides from environment."""
-    path = Path(path or os.environ.get("NETDIAG_CONFIG", "/app/config.yaml"))
-    raw: dict[str, Any] = {}
-    if path.is_file():
-        with path.open(encoding="utf-8") as fh:
-            raw = yaml.safe_load(fh) or {}
+    """Primary: NETDIAG_CONFIG_YAML from compose. Optional file only if YAML env unset."""
+    raw: dict[str, Any] = _default_raw()
+
+    inline = _env("NETDIAG_CONFIG_YAML")
+    if inline:
+        loaded = yaml.safe_load(inline) or {}
+        if not isinstance(loaded, dict):
+            raise SystemExit("NETDIAG_CONFIG_YAML must be a YAML mapping")
+        raw = _default_raw()
+        for key, value in loaded.items():
+            if isinstance(value, dict) and isinstance(raw.get(key), dict):
+                merged = dict(raw[key])
+                merged.update(value)
+                raw[key] = merged
+            else:
+                raw[key] = value
+    else:
+        path = Path(path or os.environ.get("NETDIAG_CONFIG", "/app/config.yaml"))
+        if path.is_file():
+            with path.open(encoding="utf-8") as fh:
+                file_raw = yaml.safe_load(fh) or {}
+            for key, value in file_raw.items():
+                if isinstance(value, dict) and isinstance(raw.get(key), dict):
+                    merged = dict(raw[key])
+                    merged.update(value)
+                    raw[key] = merged
+                else:
+                    raw[key] = value
 
     site = dict(raw.get("site") or {})
     vantage_raw = dict(raw.get("vantage") or {})
@@ -146,7 +203,7 @@ def load_config(path: str | Path | None = None) -> Config:
     ingest = dict(raw.get("ingest") or {})
     coord = dict(raw.get("coordinator") or {})
 
-    # Short host-specific env overlays only (compose), never JSON blobs
+    # Short host overlays from compose
     if _env("TZ"):
         site["timezone"] = _env("TZ")
     if _env("IFACE") or _env("NETDIAG_IFACE"):
@@ -168,15 +225,25 @@ def load_config(path: str | Path | None = None) -> Config:
     avail = str(vantage_raw.get("availability") or "").lower()
     if avail not in ("always", "intermittent"):
         avail = "intermittent" if link == "wifi" else "always"
+    behind = vantage_raw.get("behind_switch")
+    if isinstance(behind, str):
+        behind_switch = behind.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        behind_switch = bool(behind)
 
-    groups = [
-        Group(
-            id=str(g.get("id", "unnamed")),
-            role=str(g.get("role", "other")).lower(),
-            hosts=_parse_hosts(g.get("hosts")),
+    groups = []
+    for g in raw.get("groups") or []:
+        attach = str(g.get("attach") or "gateway").lower()
+        if attach not in ("gateway", "local_switch"):
+            attach = "gateway"
+        groups.append(
+            Group(
+                id=str(g.get("id", "unnamed")),
+                role=str(g.get("role", "other")).lower(),
+                hosts=_parse_hosts(g.get("hosts")),
+                attach=attach,
+            )
         )
-        for g in (raw.get("groups") or [])
-    ]
 
     sats: list[SatelliteExpect] = []
     for s in raw.get("satellites") or []:
@@ -184,17 +251,27 @@ def load_config(path: str | Path | None = None) -> Config:
             continue
         slink = str(s.get("link", "ethernet")).lower()
         savail = str(s.get("availability") or "").lower()
+        placement = str(s.get("placement") or "other").lower()
+        if placement not in ("router", "other"):
+            placement = "other"
         sats.append(
             SatelliteExpect(
                 id=str(s["id"]),
                 link=slink if slink in ("ethernet", "wifi") else "ethernet",
                 availability=savail if savail in ("always", "intermittent") else "",
                 note=str(s.get("note") or ""),
-                placement=str(s.get("placement") or "other").lower(),
+                placement=placement,
             )
         )
 
     iface = str(capture.get("iface") or "eth0")
+    # Capture-only short env (compose DRY — snaplen/keep without duplicating full YAML)
+    if _env("NETDIAG_SNAPLEN"):
+        capture["snaplen"] = int(_env("NETDIAG_SNAPLEN") or "256")
+    if _env("NETDIAG_KEEP_HOURS"):
+        capture["keep_hours"] = float(_env("NETDIAG_KEEP_HOURS") or "48")
+    if _env("NETDIAG_ROTATE_HOURS"):
+        capture["rotate_hours"] = float(_env("NETDIAG_ROTATE_HOURS") or "1")
     token = str(ingest.get("token") or coord.get("token") or "")
 
     return Config(
@@ -205,9 +282,10 @@ def load_config(path: str | Path | None = None) -> Config:
             link=link,
             note=str(vantage_raw.get("note", "")),
             availability=avail,
+            behind_switch=behind_switch,
         ),
         iface=iface,
-        snaplen=int(capture.get("snaplen", 128)),
+        snaplen=int(capture.get("snaplen", 256)),
         rotate_hours=int(capture.get("rotate_hours", 1)),
         keep_hours=int(capture.get("keep_hours", 48)),
         groups=groups,

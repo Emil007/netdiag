@@ -8,6 +8,8 @@ Mesh/AP **management IPs must answer ping**.
 
 ## Checklist
 
+Edit these in `docker-compose.yml` → `NETDIAG_CONFIG_YAML` (plus `IFACE` / token overlays):
+
 1. `IFACE` on the Docker host (`ip -br link`)
 2. Router canary (`role: gateway`)
 3. Optional mesh/AP canaries

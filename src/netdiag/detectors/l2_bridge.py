@@ -7,22 +7,33 @@ import time
 from dataclasses import dataclass, field
 
 
-# STP config BPDUs / RSTP often show as STP with root/bridge ids
+# STP / RSTP with tcpdump -v (root id / bridge id may be dotted or colon MACs)
 _STP = re.compile(
     r"STP.*?root[\s-]?id\s+[0-9a-f.:]+\.?([0-9a-f.]{14,17}|[0-9a-f:]{17}).*?"
     r"bridge[\s-]?id\s+[0-9a-f.:]+\.?([0-9a-f.]{14,17}|[0-9a-f:]{17})",
-    re.I,
+    re.I | re.S,
 )
-_STP_SIMPLE = re.compile(r"\bSTP\b", re.I)
+_STP_ROOT = re.compile(r"root[\s-]?id\s+([0-9a-f.:]+)", re.I)
+_STP_BRIDGE = re.compile(r"bridge[\s-]?id\s+([0-9a-f.:]+)", re.I)
+_STP_SIMPLE = re.compile(r"\bSTP\b|\b802\.1[dw]\b", re.I)
 _MAC = re.compile(r"((?:[0-9a-f]{2}[:.-]){5}[0-9a-f]{2})", re.I)
 _LLDP = re.compile(r"\bLLDP\b", re.I)
 
 
 def normalize_mac(raw: str) -> str:
+    # Prefer an explicit aa:bb:… MAC if present
+    colon = re.search(r"((?:[0-9a-f]{2}:){5}[0-9a-f]{2})", raw, re.I)
+    if colon:
+        return colon.group(1).lower()
     hex_only = re.sub(r"[^0-9a-fA-F]", "", raw)
     if len(hex_only) >= 12:
-        hex_only = hex_only[-12:]
-        return ":".join(hex_only[i : i + 2] for i in range(0, 12, 2)).lower()
+        # STP bridge-id is often PPPP + 12 hex MAC (+ optional port)
+        if len(hex_only) >= 16:
+            # drop 4-digit priority prefix when present
+            mac_hex = hex_only[4:16]
+        else:
+            mac_hex = hex_only[-12:]
+        return ":".join(mac_hex[i : i + 2] for i in range(0, 12, 2)).lower()
     return raw.lower()
 
 
@@ -75,11 +86,13 @@ class L2BridgeWatch:
 
     def _run(self) -> None:
         # Single consumer: bcast/mcast counts + STP/LLDP hints (avoids an extra forever-tcpdump).
+        # -v so Alpine/tcpdump prints STP root/bridge ids reliably
         cmd = [
             "tcpdump",
             "-i",
             self.iface,
             "-nnel",
+            "-v",
             "-l",
             "broadcast",
             "or",
@@ -138,8 +151,16 @@ class L2BridgeWatch:
         if _STP_SIMPLE.search(line) or "01:80:c2:00:00:00" in line.lower():
             m = _STP.search(line)
             macs = _MAC.findall(line)
-            bridge = normalize_mac(m.group(2)) if m else (normalize_mac(macs[0]) if macs else "unknown")
-            root = normalize_mac(m.group(1)) if m else ""
+            if m:
+                root = normalize_mac(m.group(1))
+                bridge = normalize_mac(m.group(2))
+            else:
+                br = _STP_BRIDGE.search(line)
+                rt = _STP_ROOT.search(line)
+                bridge = normalize_mac(br.group(1)) if br else (
+                    normalize_mac(macs[0]) if macs else "unknown"
+                )
+                root = normalize_mac(rt.group(1)) if rt else ""
             key = f"stp:{bridge}"
             self.bridges[key] = {
                 "kind": "stp",

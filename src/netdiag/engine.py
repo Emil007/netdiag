@@ -14,9 +14,10 @@ from .classify import (
 )
 from .config import Config, data_dir, load_config
 from .detectors.arp_watch import ArpWatch
+from .detectors.census import LanCensus
 from .detectors.dhcp_watch import DhcpWatch
 from .detectors.dns_health import dns_check
-from .detectors.iface_counters import delta, read_carrier, read_counters
+from .detectors.iface_counters import EthtoolCrcTracker, delta, read_carrier, read_counters
 from .detectors.l2_bridge import L2BridgeWatch
 from .detectors.path_check import run_path_checks_async
 from .detectors.ping_matrix import ping_round, tcp_probe
@@ -69,7 +70,12 @@ class Analyzer:
         self.open_detectors: dict[str, int] = {}  # identity -> incident id
         self.detector_last_hit: dict[str, float] = {}
         self.l2_bridges: list[dict] = []
-        self.gateway_mac_hint: str = ""
+        self.gateway_mac_hint: str = self.store.get_kv("gateway_arp_mac", "") or ""
+        # Transient NIC fault signal — cleared after quiet window; live map uses open_inc only
+        self.link_fault_last_at: float = 0.0
+        self.link_fault_note: str = ""
+        self.ethtool_crc = EthtoolCrcTracker()
+        self.census = LanCensus()
 
         learned = self.store.get_kv("dhcp_expected_mac", cfg.expected_dhcp_mac)
         self.dhcp = DhcpWatch(
@@ -77,8 +83,9 @@ class Analyzer:
             learned or cfg.expected_dhcp_mac,
             on_alarm=self._on_dhcp,
             on_learned=self._on_dhcp_learned,
+            on_client=self._on_dhcp_client,
         )
-        self.arp = ArpWatch(cfg.iface, on_conflict=self._on_arp)
+        self.arp = ArpWatch(cfg.iface, on_conflict=self._on_arp, on_speaker=self._on_arp_speaker)
         # Merged bcast pps + STP/LLDP bridge observer (one tcpdump)
         self.l2 = L2BridgeWatch(cfg.iface)
 
@@ -92,10 +99,12 @@ class Analyzer:
                 f"ERROR: interface '{cfg.iface}' not found under /sys/class/net — "
                 "counters/capture/DHCP/ARP will be dead; fix IFACE."
             )
-        if cfg.vantage.link == "ethernet" and not cfg.hosts_by_role("same_segment"):
+        if cfg.vantage.link == "ethernet" and not (
+            cfg.hosts_by_role("same_segment") or cfg.vantage.behind_switch
+        ):
             self._note(
-                "WARNING: no same_segment canary — cannot tell local-switch failure from "
-                "uplink-to-router failure on this ethernet probe."
+                "NOTE: no same_segment / behind_switch — map assumes probe at router; "
+                "cannot tell local-switch vs uplink failure."
             )
 
     def _note(self, text: str) -> None:
@@ -113,6 +122,32 @@ class Analyzer:
     def _on_arp(self, ip: str, a: str, b: str) -> None:
         msg = f"IP conflict: {ip} claimed by {a} and {b} within a short window"
         self._coalesced_detector("IP_CONFLICT", ip, msg, meta={"ip": ip, "macs": [a, b]})
+
+    def _on_arp_speaker(self, ip: str, mac: str) -> None:
+        self.census.observe(ip)
+        if mac:
+            self.census.observe(mac)
+
+    def _on_dhcp_client(self, mac: str) -> None:
+        self.census.observe(mac)
+
+    def _mark_link_fault(self, note: str) -> None:
+        self.link_fault_last_at = time.time()
+        self.link_fault_note = note
+        if self.open_inc:
+            self.open_inc["link_fault"] = True
+
+    def _link_fault_sticky(self) -> bool:
+        """True only during quiet-window after a CRC/speed event (not for live map alone)."""
+        if self.link_fault_last_at <= 0:
+            return False
+        return (time.time() - self.link_fault_last_at) < self.cfg.incident_clear_s
+
+    def _map_link_fault(self) -> bool:
+        """Live map red NIC edge only while a topology incident carries link_fault."""
+        if self.open_inc and self.open_inc.get("link_fault"):
+            return True
+        return False
 
     def _coalesced_detector(
         self, kind: str, identity: str, verdict: str, meta: dict | None = None
@@ -214,6 +249,13 @@ class Analyzer:
         carrier = read_carrier(self.cfg.iface)
         dlt = delta(self.round_counters, counters)
         self.round_counters = counters
+        et_crc = self.ethtool_crc.delta(self.cfg.iface)
+        # Prefer sysfs CRC delta; fall back to ethtool series (never absolute merge)
+        crc_delta = dlt.get("rx_crc_errors", 0)
+        if crc_delta <= 0 and et_crc > 0:
+            crc_delta = et_crc
+            dlt = dict(dlt)
+            dlt["rx_crc_errors"] = et_crc
         l2tick = self.l2.tick() if self.iface_ok else {"pps": 0, "baseline": 0, "storm": 0, "bridges": []}
         self.l2_bridges = l2tick.get("bridges") or []
 
@@ -222,11 +264,21 @@ class Analyzer:
             if self.last_speed and speed < self.last_speed:
                 note = f"NIC speed dropped {self.last_speed} → {speed} Mb/s on {self.cfg.iface}"
                 self._note(note)
+                self._mark_link_fault(note)
                 append_event(
                     f"\n=== {display_ts(utcnow_iso(), self.cfg.timezone)}  [NIC_SPEED]\n"
                     f"  Verdict:  {note}\n"
                 )
+                if self.open_inc:
+                    self.open_inc["verdict"] = (
+                        self.open_inc.get("verdict", "") + f" ({note})"
+                    ).strip()
             self.last_speed = speed
+
+        # Clear sticky after quiet window (no fresh CRC/speed)
+        if self.link_fault_last_at and not self._link_fault_sticky():
+            self.link_fault_last_at = 0.0
+            self.link_fault_note = ""
 
         lost_now: set[str] = set()
         for host, st in self.stats.items():
@@ -280,7 +332,7 @@ class Analyzer:
             "down",
             "lowerlayerdown",
         )
-        link_err = dlt.get("rx_errors", 0) + dlt.get("rx_crc_errors", 0)
+        link_err = dlt.get("rx_errors", 0) + crc_delta
 
         # Always classify local topology; warmup only suppresses WIFI_PATH / sat silence
         result = classify_loss(
@@ -294,13 +346,17 @@ class Analyzer:
             loss_threshold_pct=self.cfg.loss_threshold_pct,
         )
 
+        census_snap = self.census.snapshot(now)
         annotations: list[str] = []
         if link_err > 0:
             annotations.append(f"+{link_err} NIC receive/CRC errors this interval")
+            self._mark_link_fault(annotations[-1])
         if l2tick.get("storm"):
             annotations.append(
                 f"broadcast/multicast pps={l2tick['pps']:.0f} (baseline≈{l2tick['baseline']:.0f})"
             )
+        if census_snap.get("mass_disappear"):
+            annotations.append(census_snap["text"])
         if result and annotations:
             result.annotations.extend(annotations)
             result.verdict = result.verdict + " " + "; ".join(annotations) + "."
@@ -319,6 +375,13 @@ class Analyzer:
                 f"baseline≈{l2tick['baseline']:.0f}) without canary loss.",
                 meta={"pps": l2tick["pps"]},
             )
+        elif not result and census_snap.get("mass_disappear") and not lost_now:
+            # Soft only — phones sleeping; do not open an incident
+            if now - self.census.last_note_at > 600:
+                self._note(
+                    f"Passive {census_snap['text']} (canaries OK — often sleep/idle, not a fault)"
+                )
+                self.census.last_note_at = now
 
         # Topology incidents only through open_inc path (never blocked by LINK_ERRORS)
         if result and result.kind in ("LINK_ERRORS", "BCAST_STORM"):
@@ -375,7 +438,8 @@ class Analyzer:
         sat_states: list[dict[str, Any]],
     ) -> None:
         if result:
-            # confirmation hysteresis for ping classes
+            # confirmation hysteresis for ping classes; WIFI_PATH uses 1 round (brief stale)
+            need = 1 if result.kind == "WIFI_PATH" else self.cfg.confirm_rounds
             if result.kind not in (
                 "ROGUE_DHCP",
                 "IP_CONFLICT",
@@ -387,18 +451,27 @@ class Analyzer:
                 else:
                     self.pending_kind = result.kind
                     self.pending_rounds = 1
-                if self.pending_rounds < self.cfg.confirm_rounds and not self.open_inc:
+                if self.pending_rounds < need and not self.open_inc:
                     return
 
             self.clear_since = None
             if not self.open_inc:
+                from .topology import infer_shared_upstream
+
                 pcap = matching_pcap(self.caps, utcnow(), timezone_name=self.cfg.timezone)
                 hosts = {h: 1 for h in lost_now}
+                shared = infer_shared_upstream(self.cfg, lost_now)
+                census_snap = self.census.snapshot()
+                link_fault = self._link_fault_sticky()
                 meta = {
                     "delta": dlt,
                     "matrix": result.matrix,
                     "confidence": result.confidence,
                     "annotations": result.annotations,
+                    "link_fault": link_fault,
+                    "shared_upstream_hint": shared,
+                    "l2_bridges": list(self.l2_bridges),
+                    "census": census_snap,
                 }
                 iid = self.store.open_incident(
                     result.kind,
@@ -419,21 +492,41 @@ class Analyzer:
                     "start": utcnow(),
                     "counters0": read_counters(self.cfg.iface),
                     "matrix": result.matrix,
+                    "confidence": result.confidence,
+                    "link_fault": link_fault,
+                    "shared_upstream_hint": shared,
                 }
                 print(f"incident open [{result.kind}] id={iid}", flush=True)
             else:
+                from .topology import infer_shared_upstream
+
                 for h in lost_now:
                     self.open_inc["hosts"][h] = self.open_inc["hosts"].get(h, 0) + 1
                 self.open_inc["kind"] = result.kind
                 self.open_inc["verdict"] = result.verdict
                 self.open_inc["where_text"] = result.where_text
                 self.open_inc["matrix"] = result.matrix
+                self.open_inc["confidence"] = result.confidence
+                lost_set = set(lost_now) | set(self.open_inc.get("hosts") or {})
+                shared = infer_shared_upstream(self.cfg, lost_set)
+                self.open_inc["shared_upstream_hint"] = shared
+                if self._link_fault_sticky():
+                    self.open_inc["link_fault"] = True
+                census_snap = self.census.snapshot()
                 self.store.update_incident(
                     self.open_inc["id"],
                     kind=result.kind,
                     verdict=result.verdict,
                     hosts=self.open_inc["hosts"],
-                    meta={"delta": dlt, "matrix": result.matrix, "confidence": result.confidence},
+                    meta={
+                        "delta": dlt,
+                        "matrix": result.matrix,
+                        "confidence": result.confidence,
+                        "link_fault": bool(self.open_inc.get("link_fault")),
+                        "shared_upstream_hint": shared,
+                        "l2_bridges": list(self.l2_bridges),
+                        "census": census_snap,
+                    },
                     vantage_summary=self._vantage_summary_text(),
                     where_text=result.where_text,
                 )
@@ -621,14 +714,51 @@ class Analyzer:
             self.cfg, ping, expected_sats, self.cfg.loss_threshold_pct
         )
 
-        gw_mac = (self.store.get_kv("dhcp_expected_mac") or self.cfg.expected_dhcp_mac or "").lower()
+        gw_mac = self._gateway_mac()
         l2_list = []
         for b in self.l2_bridges:
             extra = ""
             bid = (b.get("id") or "").lower()
             if gw_mac and bid and bid != gw_mac and b.get("kind") == "stp":
-                extra = "extra L2 bridge on this segment (possible unmanaged/managed switch)"
+                extra = "possible extra bridge (STP id ≠ gateway ARP/DHCP MAC)"
             l2_list.append({**b, "extra": extra})
+
+        from .topology import build_topology, infer_shared_upstream
+
+        census_snap = self.census.snapshot()
+        open_for_topo = None
+        # Live map: NIC fault edge only from open topology incident — never sticky alone
+        link_fault = self._map_link_fault()
+        shared_hint = None
+        if self.open_inc:
+            conf = self.open_inc.get("confidence") or "single_vantage"
+            open_for_topo = {
+                "kind": self.open_inc["kind"],
+                "where_text": self.open_inc.get("where_text") or "",
+                "hosts": self.open_inc.get("hosts") or {},
+                "verdict": self.open_inc.get("verdict"),
+                "meta": {"confidence": conf},
+                "confidence": conf,
+            }
+            shared_hint = self.open_inc.get("shared_upstream_hint")
+            if census_snap.get("mass_disappear"):
+                # Hard annotate: freeze census on open incident context for the map
+                open_for_topo["meta"]["census"] = census_snap
+        else:
+            lost_hosts = {
+                h for h, st in self.stats.items() if st.get("fail_streak", 0) >= self.cfg.fail_rounds
+            }
+            shared_hint = infer_shared_upstream(self.cfg, lost_hosts)
+
+        topology = build_topology(
+            self.cfg,
+            matrix=matrix,
+            incident=open_for_topo,
+            l2_bridges=l2_list,
+            link_fault=link_fault,
+            shared_upstream_hint=shared_hint,
+            census=census_snap,
+        )
 
         dlt = delta(self.base_counters, counters)
         iface_text = (
@@ -637,8 +767,11 @@ class Analyzer:
             f"speed={carrier.get('speed')}\n"
             f"deltas since start: {dlt}\n"
             f"bcast pps={l2tick.get('pps', 0):.1f} baseline≈{l2tick.get('baseline', 0):.1f}\n"
+            f"{census_snap.get('text', 'census: n/a')}"
+            f"{' MASS' if census_snap.get('mass_disappear') else ''}\n"
             f"canaries={len(self.cfg.hosts())} satellites={len(expected_sats)}\n"
             "Note: DHCP+ARP+merged L2/bcast live sniff; capture service writes the pcap ring.\n"
+            "L2 live parse uses tcpdump -v; ring snaplen may still truncate BPDUs — see capture.snaplen.\n"
         )
         for n in self.health_notes[-5:]:
             iface_text += n + "\n"
@@ -654,6 +787,7 @@ class Analyzer:
             by_kind_weighted=by_kind,
             matrix=matrix,
             l2_bridges=l2_list,
+            topology=topology,
         )
 
         lines = [
@@ -662,6 +796,8 @@ class Analyzer:
             f"running since: {self.started_s}",
             f"vantage: {self.cfg.vantage.id} ({self.cfg.vantage.link})",
             f"iface: {self.cfg.iface} ok={self.iface_ok}",
+            f"topology: reports/topology.html",
+            f"{census_snap.get('text', 'census: n/a')}",
             "",
             "--- HEALTH ---",
         ]
@@ -687,7 +823,13 @@ class Analyzer:
         lines += ["", "--- SATELLITES ---"]
         if not sats:
             lines.append("  (none configured)")
-        for s in sats:
+        unexpected = [s for s in sats if s["status"] == "unexpected"]
+        if len(unexpected) > 8:
+            lines.append(
+                f"  (capping STATUS list: {len(unexpected)} unexpected ids; "
+                "history trimmed per vantage in SQLite)"
+            )
+        for s in sats[:40]:
             lines.append(
                 f"  {s['id']:16} {s['link']:10} {s['status']:12} "
                 f"avail={s.get('availability')} last={s['last_seen']}"
@@ -696,7 +838,23 @@ class Analyzer:
         if self.open_inc:
             lines += ["", f"OPEN INCIDENT: {self.open_inc['kind']} id={self.open_inc['id']}"]
             lines.append(f"  Where: {self.open_inc.get('where_text')}")
+            lines.append(f"  Confidence: {self.open_inc.get('confidence') or 'n/a'}")
         write_status("\n".join(lines) + "\n")
+
+    def _gateway_mac(self) -> str:
+        """Prefer ARP-learned gateway MAC; fall back to DHCP server MAC."""
+        gws = list(self.cfg.hosts_by_role("gateway"))
+        for ip in gws:
+            mac = self.arp.ip_to_mac.get(ip)
+            if mac:
+                mac = mac.lower()
+                if mac != self.gateway_mac_hint:
+                    self.gateway_mac_hint = mac
+                    self.store.set_kv("gateway_arp_mac", mac)
+                return mac
+        if self.gateway_mac_hint:
+            return self.gateway_mac_hint
+        return (self.store.get_kv("dhcp_expected_mac") or self.cfg.expected_dhcp_mac or "").lower()
 
 
 def run_analyzer(config_path: str | None = None) -> None:

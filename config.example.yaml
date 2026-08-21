@@ -1,9 +1,10 @@
 # =============================================================================
-# netdiag coordinator config — copy to config.yaml and edit.
+# netdiag coordinator config — DOCS MIRROR only.
+# Preferred setup: edit NETDIAG_CONFIG_YAML inside docker-compose.yml, then
+#   docker compose up -d
+# A separate config.yaml mount is optional (legacy / local pytest), not required.
 # Canaries only (~5–15 always-on IPs). Not an inventory of every device.
 # Do NOT list this Docker host's own IP as a canary.
-# Mesh/AP management IPs must answer ICMP ping or they are useless as canaries.
-# Phones / sleep-prone laptops are bad canaries; use intermittent satellites instead.
 # =============================================================================
 
 site:
@@ -23,7 +24,7 @@ vantage:
 capture:
   # Overridden by compose IFACE when set. Find with: ip -br link
   iface: eth0
-  snaplen: 128
+  snaplen: 256
   rotate_hours: 1
   # Old bcast-*.pcap files older than this are deleted.
   keep_hours: 48

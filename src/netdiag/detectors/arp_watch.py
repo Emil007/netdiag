@@ -20,6 +20,7 @@ _IS_AT = re.compile(
 class ArpWatch:
     iface: str
     on_conflict: Callable[[str, str, str], None] | None = None
+    on_speaker: Callable[[str, str], None] | None = None
     window_s: float = 30.0
     ip_to_mac: dict[str, str] = field(default_factory=dict)
     recent: dict[str, deque] = field(default_factory=lambda: defaultdict(deque))
@@ -102,3 +103,5 @@ class ArpWatch:
                 if self.on_conflict:
                     self.on_conflict(ip, ordered[0], ordered[1])
         self.ip_to_mac[ip] = mac
+        if self.on_speaker:
+            self.on_speaker(ip, mac)

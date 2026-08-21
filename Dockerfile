@@ -6,6 +6,7 @@ RUN apk add --no-cache \
     traceroute \
     bind-tools \
     iproute2 \
+    ethtool \
     tzdata \
     && rm -rf /var/cache/apk/*
 
